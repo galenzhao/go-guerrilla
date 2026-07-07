@@ -25,8 +25,10 @@ CREATE INDEX IF NOT EXISTS idx_alias_threads_created_at ON alias_threads(created
 `
 	aliasIndexUIDLSchema = `
 CREATE TABLE IF NOT EXISTS alias_index_uidl (
-  uidl TEXT PRIMARY KEY,
-  seen_at INTEGER NOT NULL
+  mailbox TEXT NOT NULL DEFAULT '',
+  uidl TEXT NOT NULL,
+  seen_at INTEGER NOT NULL,
+  PRIMARY KEY (mailbox, uidl)
 );
 `
 	aliasIndexStateSchema = `
@@ -95,7 +97,39 @@ func (s *AliasStore) migrate() error {
 			return fmt.Errorf("alias store migrate: %w", err)
 		}
 	}
-	return nil
+	return s.migrateUIDLTable()
+}
+
+func (s *AliasStore) migrateUIDLTable() error {
+	var hasMailbox int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_info('alias_index_uidl') WHERE name = 'mailbox'`,
+	).Scan(&hasMailbox)
+	if err != nil {
+		return err
+	}
+	if hasMailbox > 0 {
+		return nil
+	}
+	// Upgrade legacy single-mailbox schema (uidl PRIMARY KEY only).
+	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS alias_index_uidl_v2 (
+		  mailbox TEXT NOT NULL DEFAULT '',
+		  uidl TEXT NOT NULL,
+		  seen_at INTEGER NOT NULL,
+		  PRIMARY KEY (mailbox, uidl)
+		)`); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`INSERT OR IGNORE INTO alias_index_uidl_v2 (mailbox, uidl, seen_at)
+		SELECT '', uidl, seen_at FROM alias_index_uidl`); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`DROP TABLE alias_index_uidl`); err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`ALTER TABLE alias_index_uidl_v2 RENAME TO alias_index_uidl`)
+	return err
 }
 
 // Close closes the underlying database handle.
@@ -236,17 +270,21 @@ func (s *AliasStore) SetBaseline(key string) error {
 	return err
 }
 
-// IsKnownUIDL reports whether a POP3 UIDL was already seen.
-func (s *AliasStore) IsKnownUIDL(uidl string) (bool, error) {
+// IsKnownUIDL reports whether a POP3 UIDL was already seen for a mailbox.
+func (s *AliasStore) IsKnownUIDL(mailbox, uidl string) (bool, error) {
 	if s == nil || s.db == nil {
 		return false, fmt.Errorf("alias store not open")
 	}
+	mailbox = strings.TrimSpace(mailbox)
 	uidl = strings.TrimSpace(uidl)
 	if uidl == "" {
 		return false, nil
 	}
 	var exists int
-	err := s.db.QueryRow(`SELECT 1 FROM alias_index_uidl WHERE uidl = ? LIMIT 1`, uidl).Scan(&exists)
+	err := s.db.QueryRow(
+		`SELECT 1 FROM alias_index_uidl WHERE mailbox = ? AND uidl = ? LIMIT 1`,
+		mailbox, uidl,
+	).Scan(&exists)
 	if err == sql.ErrNoRows {
 		return false, nil
 	}
@@ -257,32 +295,34 @@ func (s *AliasStore) IsKnownUIDL(uidl string) (bool, error) {
 }
 
 // MarkUIDLKnown records a POP3 UIDL without indexing message content.
-func (s *AliasStore) MarkUIDLKnown(uidl string) error {
+func (s *AliasStore) MarkUIDLKnown(mailbox, uidl string) error {
 	if s == nil || s.db == nil {
 		return fmt.Errorf("alias store not open")
 	}
+	mailbox = strings.TrimSpace(mailbox)
 	uidl = strings.TrimSpace(uidl)
 	if uidl == "" {
 		return nil
 	}
 	_, err := s.db.Exec(
-		`INSERT INTO alias_index_uidl (uidl, seen_at) VALUES (?, ?)
-		 ON CONFLICT(uidl) DO NOTHING`,
-		uidl, time.Now().UTC().Unix(),
+		`INSERT INTO alias_index_uidl (mailbox, uidl, seen_at) VALUES (?, ?, ?)
+		 ON CONFLICT(mailbox, uidl) DO NOTHING`,
+		mailbox, uidl, time.Now().UTC().Unix(),
 	)
 	return err
 }
 
-// MarkUIDLsKnown records many UIDLs in one transaction.
-func (s *AliasStore) MarkUIDLsKnown(uidls []string) error {
+// MarkUIDLsKnown records many UIDLs in one transaction for a mailbox.
+func (s *AliasStore) MarkUIDLsKnown(mailbox string, uidls []string) error {
 	if len(uidls) == 0 {
 		return nil
 	}
+	mailbox = strings.TrimSpace(mailbox)
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
-	stmt, err := tx.Prepare(`INSERT INTO alias_index_uidl (uidl, seen_at) VALUES (?, ?) ON CONFLICT(uidl) DO NOTHING`)
+	stmt, err := tx.Prepare(`INSERT INTO alias_index_uidl (mailbox, uidl, seen_at) VALUES (?, ?, ?) ON CONFLICT(mailbox, uidl) DO NOTHING`)
 	if err != nil {
 		_ = tx.Rollback()
 		return err
@@ -294,7 +334,7 @@ func (s *AliasStore) MarkUIDLsKnown(uidls []string) error {
 		if uidl == "" {
 			continue
 		}
-		if _, err := stmt.Exec(uidl, now); err != nil {
+		if _, err := stmt.Exec(mailbox, uidl, now); err != nil {
 			_ = tx.Rollback()
 			return err
 		}

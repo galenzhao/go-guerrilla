@@ -6,18 +6,19 @@ import (
 	"fmt"
 	"net/mail"
 	"strings"
+	"sync"
 	"time"
 )
 
 // parsedMailHeaders holds fields extracted from a message header block.
 type parsedMailHeaders struct {
-	MessageID    string
-	From         string
-	To           string
-	Cc           string
-	DeliveredTo  string
-	XOriginalTo  string
-	Date         time.Time
+	MessageID   string
+	From        string
+	To          string
+	Cc          string
+	DeliveredTo string
+	XOriginalTo string
+	Date        time.Time
 }
 
 func parseMailHeaders(raw string) (parsedMailHeaders, error) {
@@ -74,22 +75,42 @@ func extractReplyAsAddress(h parsedMailHeaders, mailbox string) string {
 	return ""
 }
 
-// AliasIndexerConfig configures the POP3 alias indexer.
-type AliasIndexerConfig struct {
-	DBPath                  string
-	POP3Host                string
-	POP3Port                int
-	POP3TLS                 bool
-	POP3User                string
-	POP3Password            string
-	PollInterval            time.Duration
-	PurgeInterval           time.Duration
-	SkipExistingOnStart     bool
-	Since                   time.Time
-	StoreCfg                AliasStoreConfig
+// AliasPOP3Account is one POP3 mailbox to index.
+type AliasPOP3Account struct {
+	Host     string
+	Port     int
+	TLS      bool
+	User     string
+	Password string
 }
 
-// AliasIndexer polls a POP3 mailbox and writes alias thread mappings.
+// MailboxKey returns the stable key for UIDL baseline and cursor storage.
+func (a AliasPOP3Account) MailboxKey() string {
+	return fmt.Sprintf("pop3:%s@%s", strings.TrimSpace(a.User), strings.TrimSpace(a.Host))
+}
+
+func (a AliasPOP3Account) validate() error {
+	if strings.TrimSpace(a.Host) == "" {
+		return fmt.Errorf("alias_index pop3 host is required")
+	}
+	if strings.TrimSpace(a.User) == "" {
+		return fmt.Errorf("alias_index pop3 user is required for host %s", a.Host)
+	}
+	return nil
+}
+
+// AliasIndexerConfig configures the POP3 alias indexer.
+type AliasIndexerConfig struct {
+	DBPath              string
+	Accounts            []AliasPOP3Account
+	PollInterval        time.Duration
+	PurgeInterval       time.Duration
+	SkipExistingOnStart bool
+	Since               time.Time
+	StoreCfg            AliasStoreConfig
+}
+
+// AliasIndexer polls one or more POP3 mailboxes and writes alias thread mappings.
 type AliasIndexer struct {
 	cfg   AliasIndexerConfig
 	store *AliasStore
@@ -97,14 +118,16 @@ type AliasIndexer struct {
 
 // NewAliasIndexer creates an indexer using the given config.
 func NewAliasIndexer(cfg AliasIndexerConfig) (*AliasIndexer, error) {
-	if strings.TrimSpace(cfg.POP3Host) == "" {
-		return nil, fmt.Errorf("alias_index_pop3_host is required")
+	if len(cfg.Accounts) == 0 {
+		return nil, fmt.Errorf("at least one alias_index POP3 account is required")
 	}
-	if strings.TrimSpace(cfg.POP3User) == "" {
-		return nil, fmt.Errorf("alias_index_pop3_user is required")
-	}
-	if cfg.POP3Port <= 0 {
-		cfg.POP3Port = 995
+	for i := range cfg.Accounts {
+		if cfg.Accounts[i].Port <= 0 {
+			cfg.Accounts[i].Port = 995
+		}
+		if err := cfg.Accounts[i].validate(); err != nil {
+			return nil, fmt.Errorf("alias_index_pop3_accounts[%d]: %w", i, err)
+		}
 	}
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = 60 * time.Second
@@ -137,10 +160,6 @@ func (i *AliasIndexer) Close() error {
 	return i.store.Close()
 }
 
-func (i *AliasIndexer) baselineKey() string {
-	return fmt.Sprintf("pop3:%s@%s", i.cfg.POP3User, i.cfg.POP3Host)
-}
-
 // Run polls until the done channel is closed.
 func (i *AliasIndexer) Run(done <-chan struct{}) error {
 	purgeTicker := time.NewTicker(i.cfg.PurgeInterval)
@@ -148,9 +167,7 @@ func (i *AliasIndexer) Run(done <-chan struct{}) error {
 	pollTicker := time.NewTicker(i.cfg.PollInterval)
 	defer pollTicker.Stop()
 
-	if err := i.pollOnce(); err != nil {
-		Log().WithError(err).Error("alias-index initial poll failed")
-	}
+	i.pollAll()
 	for {
 		select {
 		case <-done:
@@ -160,21 +177,34 @@ func (i *AliasIndexer) Run(done <-chan struct{}) error {
 				Log().WithError(err).Warn("alias-index purge failed")
 			}
 		case <-pollTicker.C:
-			if err := i.pollOnce(); err != nil {
-				Log().WithError(err).Error("alias-index poll failed")
-			}
+			i.pollAll()
 		}
 	}
 }
 
-func (i *AliasIndexer) pollOnce() error {
-	client, err := dialPOP3(i.cfg.POP3Host, i.cfg.POP3Port, i.cfg.POP3TLS)
+func (i *AliasIndexer) pollAll() {
+	var wg sync.WaitGroup
+	for _, account := range i.cfg.Accounts {
+		account := account
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := i.pollMailbox(account); err != nil {
+				Log().WithError(err).WithField("mailbox", account.MailboxKey()).Error("alias-index poll failed")
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func (i *AliasIndexer) pollMailbox(account AliasPOP3Account) error {
+	client, err := dialPOP3(account.Host, account.Port, account.TLS)
 	if err != nil {
 		return err
 	}
 	defer client.Close()
 
-	if err := client.Auth(i.cfg.POP3User, i.cfg.POP3Password); err != nil {
+	if err := client.Auth(account.User, account.Password); err != nil {
 		return err
 	}
 
@@ -183,8 +213,8 @@ func (i *AliasIndexer) pollOnce() error {
 		return err
 	}
 
-	baselineKey := i.baselineKey()
-	hasBaseline, err := i.store.HasBaseline(baselineKey)
+	mailboxKey := account.MailboxKey()
+	hasBaseline, err := i.store.HasBaseline(mailboxKey)
 	if err != nil {
 		return err
 	}
@@ -194,20 +224,23 @@ func (i *AliasIndexer) pollOnce() error {
 		for _, item := range uidls {
 			known = append(known, item.UIDL)
 		}
-		if err := i.store.MarkUIDLsKnown(known); err != nil {
+		if err := i.store.MarkUIDLsKnown(mailboxKey, known); err != nil {
 			return err
 		}
-		if err := i.store.SetBaseline(baselineKey); err != nil {
+		if err := i.store.SetBaseline(mailboxKey); err != nil {
 			return err
 		}
-		Log().WithField("uidl_count", len(known)).Info("alias-index recorded POP3 UIDL baseline; existing mail skipped")
+		Log().WithFields(map[string]interface{}{
+			"mailbox":   mailboxKey,
+			"uidl_count": len(known),
+		}).Info("alias-index recorded POP3 UIDL baseline; existing mail skipped")
 		return nil
 	}
 
 	indexed := 0
 	skipped := 0
 	for _, item := range uidls {
-		known, err := i.store.IsKnownUIDL(item.UIDL)
+		known, err := i.store.IsKnownUIDL(mailboxKey, item.UIDL)
 		if err != nil {
 			return err
 		}
@@ -221,15 +254,18 @@ func (i *AliasIndexer) pollOnce() error {
 		}
 		headers, err := parseMailHeaders(raw)
 		if err != nil {
-			Log().WithError(err).WithField("uidl", item.UIDL).Warn("alias-index header parse failed; marking UIDL known")
-			if err := i.store.MarkUIDLKnown(item.UIDL); err != nil {
+			Log().WithError(err).WithFields(map[string]interface{}{
+				"mailbox": mailboxKey,
+				"uidl":    item.UIDL,
+			}).Warn("alias-index header parse failed; marking UIDL known")
+			if err := i.store.MarkUIDLKnown(mailboxKey, item.UIDL); err != nil {
 				return err
 			}
 			continue
 		}
 
 		if !i.cfg.Since.IsZero() && !headers.Date.IsZero() && headers.Date.Before(i.cfg.Since) {
-			if err := i.store.MarkUIDLKnown(item.UIDL); err != nil {
+			if err := i.store.MarkUIDLKnown(mailboxKey, item.UIDL); err != nil {
 				return err
 			}
 			skipped++
@@ -237,10 +273,11 @@ func (i *AliasIndexer) pollOnce() error {
 		}
 
 		messageID := normalizeMessageID(headers.MessageID)
-		replyAs := extractReplyAsAddress(headers, i.cfg.POP3User)
+		replyAs := extractReplyAsAddress(headers, account.User)
 		origFrom := extractFirstEmailFromHeader(headers.From)
 		if messageID == "" || replyAs == "" || origFrom == "" {
 			Log().WithFields(map[string]interface{}{
+				"mailbox":    mailboxKey,
 				"uidl":       item.UIDL,
 				"message_id": headers.MessageID,
 				"to":         headers.To,
@@ -248,7 +285,7 @@ func (i *AliasIndexer) pollOnce() error {
 				"x_orig":     headers.XOriginalTo,
 				"from":       headers.From,
 			}).Debug("alias-index skipping message without indexable headers")
-			if err := i.store.MarkUIDLKnown(item.UIDL); err != nil {
+			if err := i.store.MarkUIDLKnown(mailboxKey, item.UIDL); err != nil {
 				return err
 			}
 			continue
@@ -262,7 +299,7 @@ func (i *AliasIndexer) pollOnce() error {
 		}); err != nil {
 			return err
 		}
-		if err := i.store.MarkUIDLKnown(item.UIDL); err != nil {
+		if err := i.store.MarkUIDLKnown(mailboxKey, item.UIDL); err != nil {
 			return err
 		}
 		indexed++
@@ -270,6 +307,7 @@ func (i *AliasIndexer) pollOnce() error {
 
 	if indexed > 0 || skipped > 0 {
 		Log().WithFields(map[string]interface{}{
+			"mailbox": mailboxKey,
 			"indexed": indexed,
 			"skipped": skipped,
 		}).Info("alias-index poll complete")
@@ -281,26 +319,9 @@ func (i *AliasIndexer) pollOnce() error {
 func AliasIndexerConfigFromBackend(backendConfig BackendConfig) (AliasIndexerConfig, error) {
 	cfg := AliasIndexerConfig{
 		SkipExistingOnStart: true,
-		POP3TLS:             true,
-		POP3Port:            995,
 	}
 	if v, ok := backendConfig["alias_db_path"].(string); ok {
 		cfg.DBPath = strings.TrimSpace(v)
-	}
-	if v, ok := backendConfig["alias_index_pop3_host"].(string); ok {
-		cfg.POP3Host = strings.TrimSpace(v)
-	}
-	if v, ok := backendConfig["alias_index_pop3_user"].(string); ok {
-		cfg.POP3User = strings.TrimSpace(v)
-	}
-	if v, ok := backendConfig["alias_index_pop3_password"].(string); ok {
-		cfg.POP3Password = v
-	}
-	if v, ok := backendConfig["alias_index_pop3_port"].(float64); ok && int(v) > 0 {
-		cfg.POP3Port = int(v)
-	}
-	if v, ok := backendConfig["alias_index_pop3_tls"].(bool); ok {
-		cfg.POP3TLS = v
 	}
 	if v, ok := backendConfig["alias_index_skip_existing_on_start"].(bool); ok {
 		cfg.SkipExistingOnStart = v
@@ -336,6 +357,99 @@ func AliasIndexerConfigFromBackend(backendConfig BackendConfig) (AliasIndexerCon
 		}
 		cfg.Since = t.UTC()
 	}
+
+	accounts, err := parseAliasPOP3Accounts(backendConfig)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.Accounts = accounts
 	cfg.StoreCfg.DBPath = cfg.DBPath
 	return cfg, nil
+}
+
+func parseAliasPOP3Accounts(backendConfig BackendConfig) ([]AliasPOP3Account, error) {
+	if raw, ok := backendConfig["alias_index_pop3_accounts"]; ok && raw != nil {
+		accounts, err := parseAliasPOP3AccountsList(raw)
+		if err != nil {
+			return nil, err
+		}
+		if len(accounts) > 0 {
+			return accounts, nil
+		}
+	}
+	legacy, err := parseLegacyAliasPOP3Account(backendConfig)
+	if err != nil {
+		return nil, err
+	}
+	if legacy != nil {
+		return []AliasPOP3Account{*legacy}, nil
+	}
+	return nil, fmt.Errorf("alias_index_pop3_accounts or alias_index_pop3_host/user is required")
+}
+
+func parseAliasPOP3AccountsList(raw interface{}) ([]AliasPOP3Account, error) {
+	items, ok := raw.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("alias_index_pop3_accounts must be an array")
+	}
+	accounts := make([]AliasPOP3Account, 0, len(items))
+	for i, item := range items {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("alias_index_pop3_accounts[%d] must be an object", i)
+		}
+		account, err := parseAliasPOP3AccountMap(m)
+		if err != nil {
+			return nil, fmt.Errorf("alias_index_pop3_accounts[%d]: %w", i, err)
+		}
+		accounts = append(accounts, account)
+	}
+	return accounts, nil
+}
+
+func parseLegacyAliasPOP3Account(backendConfig BackendConfig) (*AliasPOP3Account, error) {
+	host, _ := backendConfig["alias_index_pop3_host"].(string)
+	user, _ := backendConfig["alias_index_pop3_user"].(string)
+	if strings.TrimSpace(host) == "" && strings.TrimSpace(user) == "" {
+		return nil, nil
+	}
+	account := AliasPOP3Account{
+		Host:     strings.TrimSpace(host),
+		User:     strings.TrimSpace(user),
+		TLS:      true,
+		Port:     995,
+	}
+	if v, ok := backendConfig["alias_index_pop3_password"].(string); ok {
+		account.Password = v
+	}
+	if v, ok := backendConfig["alias_index_pop3_port"].(float64); ok && int(v) > 0 {
+		account.Port = int(v)
+	}
+	if v, ok := backendConfig["alias_index_pop3_tls"].(bool); ok {
+		account.TLS = v
+	}
+	return &account, nil
+}
+
+func parseAliasPOP3AccountMap(m map[string]interface{}) (AliasPOP3Account, error) {
+	account := AliasPOP3Account{
+		TLS:  true,
+		Port: 995,
+	}
+	if v, ok := m["host"].(string); ok {
+		account.Host = strings.TrimSpace(v)
+	}
+	if v, ok := m["user"].(string); ok {
+		account.User = strings.TrimSpace(v)
+	}
+	if v, ok := m["password"].(string); ok {
+		account.Password = v
+	}
+	if v, ok := m["port"].(float64); ok && int(v) > 0 {
+		account.Port = int(v)
+	}
+	if v, ok := m["tls"].(bool); ok {
+		account.TLS = v
+	}
+	return account, account.validate()
 }

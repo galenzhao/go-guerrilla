@@ -63,6 +63,13 @@ func runAliasIndex(cmd *cobra.Command, args []string) {
 	}()
 
 	mainlog.Info("alias-index started")
+	if len(indexerCfg.Accounts) > 0 {
+		mailboxes := make([]string, 0, len(indexerCfg.Accounts))
+		for _, account := range indexerCfg.Accounts {
+			mailboxes = append(mailboxes, account.MailboxKey())
+		}
+		mainlog.WithField("mailboxes", mailboxes).Infof("alias-index watching %d POP3 mailbox(es)", len(mailboxes))
+	}
 	if err := indexer.Run(done); err != nil {
 		mainlog.WithError(err).Fatal("alias-index stopped with error")
 	}

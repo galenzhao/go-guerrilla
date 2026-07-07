@@ -115,14 +115,14 @@ Copy `goguerrilla.conf.sample` to `goguerrilla.conf` and configure:
 
 | Area | Key settings |
 |------|----------------|
-| Alias index | `alias_index_pop3_*`, `alias_db_path`, `alias_index_ttl` (default `180d`) |
+| Alias index | `alias_index_pop3_accounts` (array), `alias_db_path`, `alias_index_ttl` (default `180d`) |
 | Reply lookup | `AliasResolve` in `save_process`, `alias_fail_hard: true` |
 | Outbound send | `OCIEmail` or `SES` in `save_process`; `ociemail_source_tmpl: "${hdr_x_guerrilla_reply_as}"` |
 | Mail client | SMTP → `127.0.0.1:2525`; POP3 stays on your provider |
 
 **How alias reply works**
 
-- `alias-index` polls POP3, records only **new** messages (UIDL baseline; no full mailbox backfill).
+- `alias-index` polls POP3, records only **new** messages (UIDL baseline per mailbox; no full mailbox backfill).
 - Each indexed message stores `Message-ID → reply_as` (from `To` / `Delivered-To` / `X-Original-To`) in SQLite (`alias.db`).
 - On reply, `AliasResolve` looks up `In-Reply-To` / `References` and injects `X-Guerrilla-Reply-As`.
 - `RewriteFrom` and `OCIEmail`/`SES` use `${hdr_x_guerrilla_reply_as}` as `MAIL FROM`.

@@ -90,10 +90,10 @@ func TestAliasStoreUIDLBaseline(t *testing.T) {
 	if err != nil || has {
 		t.Fatalf("unexpected baseline: has=%v err=%v", has, err)
 	}
-	if err := store.MarkUIDLsKnown([]string{"uid-1", "uid-2"}); err != nil {
+	if err := store.MarkUIDLsKnown(key, []string{"uid-1", "uid-2"}); err != nil {
 		t.Fatal(err)
 	}
-	known, err := store.IsKnownUIDL("uid-1")
+	known, err := store.IsKnownUIDL(key, "uid-1")
 	if err != nil || !known {
 		t.Fatalf("uid-1 should be known")
 	}

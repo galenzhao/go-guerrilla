@@ -27,11 +27,22 @@
         "alias_index_purge_interval": "1h",
         "alias_index_poll_interval": "60s",
         "alias_index_skip_existing_on_start": true,
-        "alias_index_pop3_host": "pop.example.com",
-        "alias_index_pop3_port": 995,
-        "alias_index_pop3_tls": true,
-        "alias_index_pop3_user": "all@example.com",
-        "alias_index_pop3_password": "change-me",
+        "alias_index_pop3_accounts": [
+            {
+                "host": "pop.example.com",
+                "port": 995,
+                "tls": true,
+                "user": "all@example.com",
+                "password": "change-me"
+            },
+            {
+                "host": "pop.other.example.com",
+                "port": 995,
+                "tls": true,
+                "user": "catchall@other.example.com",
+                "password": "change-me"
+            }
+        ],
 
         "ses_region": "us-east-1",
         "ses_timeout": "10s",
