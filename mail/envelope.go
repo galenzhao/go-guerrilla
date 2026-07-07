@@ -10,6 +10,7 @@ import (
 	"mime"
 	"net"
 	"net/textproto"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -160,7 +161,9 @@ func NewEnvelope(remoteAddr string, clientID uint64) *Envelope {
 }
 
 func queuedID(clientID uint64) string {
-	return fmt.Sprintf("%x", md5.Sum([]byte(string(time.Now().Unix())+string(clientID))))
+	now := strconv.FormatInt(time.Now().Unix(), 10)
+	id := strconv.FormatUint(clientID, 10)
+	return fmt.Sprintf("%x", md5.Sum([]byte(now+id)))
 }
 
 // ParseHeaders parses the headers into Header field of the Envelope struct.
@@ -178,9 +181,16 @@ func (e *Envelope) ParseHeaders() error {
 		buf = buf[:maxHeaderChunk]
 	}
 
-	headerEnd := bytes.Index(buf, []byte{'\n', '\n'}) // the first two new-lines chars are the End Of Header
+	// SMTP messages typically use CRLF line endings. Support both "\r\n\r\n" and "\n\n".
+	headerEnd := bytes.Index(buf, []byte{'\r', '\n', '\r', '\n'})
+	headerDelimLen := 4
+	if headerEnd == -1 {
+		headerEnd = bytes.Index(buf, []byte{'\n', '\n'})
+		headerDelimLen = 2
+	}
+
 	if headerEnd > -1 {
-		header := buf[0 : headerEnd+2]
+		header := buf[0 : headerEnd+headerDelimLen]
 		headerReader := textproto.NewReader(bufio.NewReader(bytes.NewBuffer(header)))
 		e.Header, err = headerReader.ReadMIMEHeader()
 		if err == nil || err == io.EOF {

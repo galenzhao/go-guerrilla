@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -75,6 +76,7 @@ func sigHandler() {
 		if sig == syscall.SIGHUP {
 			if ac, err := readConfig(configPath, pidFile); err == nil {
 				_ = d.ReloadConfig(*ac)
+				applyAuthenticator(ac)
 			} else {
 				mainlog.WithError(err).Error("Could not reload config")
 			}
@@ -110,6 +112,7 @@ func serve(cmd *cobra.Command, args []string) {
 		mainlog.WithError(err).Fatal("Error while reading config")
 	}
 	_ = d.SetConfig(*c)
+	applyAuthenticator(c)
 
 	// Check that max clients is not greater than system open file limit.
 	if ok, maxClients, fileLimit := guerrilla.CheckFileLimit(c); !ok {
@@ -124,6 +127,23 @@ func serve(cmd *cobra.Command, args []string) {
 	}
 	sigHandler()
 
+}
+
+func applyAuthenticator(c *guerrilla.AppConfig) {
+	if c == nil || !c.Auth.Enabled {
+		d.SetAuthenticator(nil)
+		return
+	}
+	if !strings.EqualFold(c.Auth.Type, "http") {
+		mainlog.Errorf("unsupported auth.type: %s", c.Auth.Type)
+		return
+	}
+	authenticator, err := guerrilla.NewHTTPAuthenticatorFromConfig(c.Auth)
+	if err != nil {
+		mainlog.WithError(err).Error("failed to initialize auth backend")
+		return
+	}
+	d.SetAuthenticator(authenticator)
 }
 
 // ReadConfig is called at startup, or when a SIG_HUP is caught

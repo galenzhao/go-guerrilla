@@ -20,6 +20,7 @@ type Daemon struct {
 	// Guerrilla will be managed through the API
 	g Guerrilla
 
+	authenticator Authenticator
 	configLoadTime time.Time
 	subs           []deferredSub
 }
@@ -61,6 +62,9 @@ func (d *Daemon) Start() (err error) {
 		if err != nil {
 			return err
 		}
+		if d.authenticator != nil {
+			d.g.SetAuthenticator(d.authenticator)
+		}
 		for i := range d.subs {
 			_ = d.Subscribe(d.subs[i].topic, d.subs[i].fn)
 
@@ -75,6 +79,15 @@ func (d *Daemon) Start() (err error) {
 
 	}
 	return err
+}
+
+// SetAuthenticator sets an SMTP AUTH authenticator. If called before Start(),
+// it will be applied when the daemon is started.
+func (d *Daemon) SetAuthenticator(a Authenticator) {
+	d.authenticator = a
+	if d.g != nil {
+		d.g.SetAuthenticator(a)
+	}
 }
 
 // Shuts down the daemon, including servers and backend.

@@ -31,6 +31,23 @@ type AppConfig struct {
 	LogLevel string `json:"log_level,omitempty"`
 	// BackendConfig configures the email envelope processing backend
 	BackendConfig backends.BackendConfig `json:"backend_config"`
+	// Auth configures SMTP AUTH for relaying.
+	Auth AuthConfig `json:"auth,omitempty"`
+}
+
+// AuthConfig configures SMTP AUTH backends.
+// Currently only HTTP authenticator is supported by configuration.
+type AuthConfig struct {
+	// Enabled turns on SMTP AUTH advertisement and relay auth checks.
+	Enabled bool `json:"enabled,omitempty"`
+	// Type selects the authenticator implementation. Supported: "http".
+	Type string `json:"type,omitempty"`
+	// URL is the HTTP endpoint used for authentication when Type == "http".
+	URL string `json:"url,omitempty"`
+	// Timeout is the HTTP client timeout, eg "2s".
+	Timeout string `json:"timeout,omitempty"`
+	// Headers are static headers included in the auth HTTP request.
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 // ServerConfig specifies config options for a single server
@@ -316,6 +333,16 @@ func (c *AppConfig) setDefaults() error {
 				return err
 			}
 		}
+	}
+	// auth defaults
+	if c.Auth.Type == "" {
+		c.Auth.Type = "http"
+	}
+	if c.Auth.Timeout == "" {
+		c.Auth.Timeout = "2s"
+	}
+	if c.Auth.URL == "" {
+		c.Auth.URL = "http://127.0.0.1:8080/auth"
 	}
 	return nil
 }

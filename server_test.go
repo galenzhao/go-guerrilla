@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"bufio"
+	"encoding/base64"
+	"errors"
 	"net/textproto"
 	"strings"
 	"sync"
@@ -19,6 +21,54 @@ import (
 	"github.com/flashmob/go-guerrilla/mail"
 	"github.com/flashmob/go-guerrilla/mocks"
 )
+
+type staticPlainAuthenticator struct {
+	user string
+	pass string
+}
+
+func (a staticPlainAuthenticator) AuthenticatePlain(identity, username, password string, e *mail.Envelope) (bool, error) {
+	if username == a.user && password == a.pass {
+		return true, nil
+	}
+	return false, nil
+}
+
+func mustFreeTCPAddrAuth(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = l.Close() }()
+	return l.Addr().String()
+}
+
+func readSMTPReplyLine(r *bufio.Reader) (string, error) {
+	s, err := r.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimRight(s, "\r\n"), nil
+}
+
+func readEHLOReply(r *bufio.Reader) ([]string, error) {
+	lines := make([]string, 0, 8)
+	for {
+		line, err := readSMTPReplyLine(r)
+		if err != nil {
+			return lines, err
+		}
+		lines = append(lines, line)
+		// last line is "250 <text>" (space, not dash)
+		if strings.HasPrefix(line, "250 ") {
+			return lines, nil
+		}
+		if !strings.HasPrefix(line, "250-") {
+			return lines, errors.New("unexpected EHLO reply: " + line)
+		}
+	}
+}
 
 // getMockServerConfig gets a mock ServerConfig struct used for creating a new server
 func getMockServerConfig() *ServerConfig {
@@ -492,7 +542,7 @@ func TestGithubIssue198(t *testing.T) {
 }
 
 func sendMessage(greet string, TLS bool, w *textproto.Writer, t *testing.T, line string, r *textproto.Reader, err error, client *client) string {
-	if err := w.PrintfLine(greet + " test.test.com"); err != nil {
+	if err := w.PrintfLine("%s test.test.com", greet); err != nil {
 		t.Error(err)
 	}
 	for {
@@ -1147,4 +1197,277 @@ func TestAllowsHosts(t *testing.T) {
 	// no wilcards
 	s.setAllowedHosts([]string{"grr.la", "example.com"})
 
+}
+
+func TestAuthPlainAdvertisedOnEHLO(t *testing.T) {
+	defer cleanTestArtifacts(t)
+
+	addr := mustFreeTCPAddrAuth(t)
+	cfg := &AppConfig{
+		LogFile:      log.OutputOff.String(),
+		AllowedHosts: []string{"local.test"},
+		Servers: []ServerConfig{{
+			IsEnabled:       true,
+			Hostname:        "mail.local.test",
+			ListenInterface: addr,
+			MaxSize:         1024 * 1024,
+			Timeout:         5,
+			MaxClients:      10,
+			TLS:            ServerTLSConfig{StartTLSOn: false, AlwaysOn: false},
+		}},
+	}
+	d := Daemon{Config: cfg}
+	d.SetAuthenticator(staticPlainAuthenticator{user: "u", pass: "p"})
+	if err := d.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer d.Shutdown()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	r := bufio.NewReader(conn)
+	// greeting
+	if _, err := readSMTPReplyLine(r); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fmt.Fprint(conn, "EHLO host\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	lines, err := readEHLOReply(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, l := range lines {
+		if strings.Contains(l, "AUTH PLAIN") && strings.Contains(l, "LOGIN") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected EHLO to advertise AUTH PLAIN LOGIN, got: %v", lines)
+	}
+}
+
+func TestAuthLoginSuccess(t *testing.T) {
+	defer cleanTestArtifacts(t)
+
+	addr := mustFreeTCPAddrAuth(t)
+	cfg := &AppConfig{
+		LogFile:      log.OutputOff.String(),
+		AllowedHosts: []string{"local.test"},
+		Servers: []ServerConfig{{
+			IsEnabled:       true,
+			Hostname:        "mail.local.test",
+			ListenInterface: addr,
+			MaxSize:         1024 * 1024,
+			Timeout:         5,
+			MaxClients:      10,
+			TLS:            ServerTLSConfig{StartTLSOn: false, AlwaysOn: false},
+		}},
+	}
+	d := Daemon{Config: cfg}
+	d.SetAuthenticator(staticPlainAuthenticator{user: "u", pass: "p"})
+	if err := d.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer d.Shutdown()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	r := bufio.NewReader(conn)
+	// greeting
+	if _, err := readSMTPReplyLine(r); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fmt.Fprint(conn, "EHLO host\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readEHLOReply(r); err != nil {
+		t.Fatal(err)
+	}
+
+	// AUTH LOGIN (challenge/response)
+	if _, err := fmt.Fprint(conn, "AUTH LOGIN\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	line, err := readSMTPReplyLine(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(line, "334") {
+		t.Fatalf("expected 334 username challenge, got %q", line)
+	}
+	if _, err := fmt.Fprintf(conn, "%s\r\n", base64.StdEncoding.EncodeToString([]byte("u"))); err != nil {
+		t.Fatal(err)
+	}
+	line, err = readSMTPReplyLine(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(line, "334") {
+		t.Fatalf("expected 334 password challenge, got %q", line)
+	}
+	if _, err := fmt.Fprintf(conn, "%s\r\n", base64.StdEncoding.EncodeToString([]byte("p"))); err != nil {
+		t.Fatal(err)
+	}
+	line, err = readSMTPReplyLine(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(line, "235") {
+		t.Fatalf("expected AUTH 235, got %q", line)
+	}
+}
+
+func TestRelayRequiresAuthThenAllowsAfterAuthPlain(t *testing.T) {
+	defer cleanTestArtifacts(t)
+
+	addr := mustFreeTCPAddrAuth(t)
+	cfg := &AppConfig{
+		LogFile:      log.OutputOff.String(),
+		AllowedHosts: []string{"local.test"},
+		Servers: []ServerConfig{{
+			IsEnabled:       true,
+			Hostname:        "mail.local.test",
+			ListenInterface: addr,
+			MaxSize:         1024 * 1024,
+			Timeout:         5,
+			MaxClients:      10,
+			TLS:            ServerTLSConfig{StartTLSOn: false, AlwaysOn: false},
+		}},
+	}
+	d := Daemon{Config: cfg}
+	d.SetAuthenticator(staticPlainAuthenticator{user: "u", pass: "p"})
+	if err := d.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer d.Shutdown()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	r := bufio.NewReader(conn)
+	// greeting
+	if _, err := readSMTPReplyLine(r); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fmt.Fprint(conn, "EHLO host\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readEHLOReply(r); err != nil {
+		t.Fatal(err)
+	}
+
+	// relay recipient should require AUTH
+	if _, err := fmt.Fprint(conn, "RCPT TO:<b@relay.example>\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	line, err := readSMTPReplyLine(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(line, "530") {
+		t.Fatalf("expected RCPT 530 (auth required), got %q", line)
+	}
+
+	// AUTH PLAIN
+	payload := "\x00u\x00p"
+	ir := base64.StdEncoding.EncodeToString([]byte(payload))
+	if _, err := fmt.Fprintf(conn, "AUTH PLAIN %s\r\n", ir); err != nil {
+		t.Fatal(err)
+	}
+	line, err = readSMTPReplyLine(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(line, "235") {
+		t.Fatalf("expected AUTH 235, got %q", line)
+	}
+
+	if _, err := fmt.Fprint(conn, "MAIL FROM:<a@x>\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	line, err = readSMTPReplyLine(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(line, "250") {
+		t.Fatalf("expected MAIL FROM 250 after AUTH, got %q", line)
+	}
+
+	// Retry RCPT, should now pass
+	if _, err := fmt.Fprint(conn, "RCPT TO:<b@relay.example>\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	line, err = readSMTPReplyLine(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(line, "250") {
+		t.Fatalf("expected RCPT 250 after AUTH, got %q", line)
+	}
+}
+
+func TestAuthPlainInvalidCredentials(t *testing.T) {
+	defer cleanTestArtifacts(t)
+
+	addr := mustFreeTCPAddrAuth(t)
+	cfg := &AppConfig{
+		LogFile:      log.OutputOff.String(),
+		AllowedHosts: []string{"local.test"},
+		Servers: []ServerConfig{{
+			IsEnabled:       true,
+			Hostname:        "mail.local.test",
+			ListenInterface: addr,
+			MaxSize:         1024 * 1024,
+			Timeout:         5,
+			MaxClients:      10,
+			TLS:            ServerTLSConfig{StartTLSOn: false, AlwaysOn: false},
+		}},
+	}
+	d := Daemon{Config: cfg}
+	d.SetAuthenticator(staticPlainAuthenticator{user: "u", pass: "p"})
+	if err := d.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer d.Shutdown()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	r := bufio.NewReader(conn)
+	// greeting
+	if _, err := readSMTPReplyLine(r); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fmt.Fprint(conn, "EHLO host\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readEHLOReply(r); err != nil {
+		t.Fatal(err)
+	}
+
+	payload := "\x00u\x00wrong"
+	ir := base64.StdEncoding.EncodeToString([]byte(payload))
+	if _, err := fmt.Fprintf(conn, "AUTH PLAIN %s\r\n", ir); err != nil {
+		t.Fatal(err)
+	}
+	line, err := readSMTPReplyLine(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(line, "535") {
+		t.Fatalf("expected AUTH 535, got %q", line)
+	}
 }

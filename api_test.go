@@ -16,6 +16,16 @@ import (
 	"time"
 )
 
+func mustFreeTCPAddr(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to get free port: %v", err)
+	}
+	defer func() { _ = l.Close() }()
+	return l.Addr().String()
+}
+
 // Test Starting smtp without setting up logger / backend
 func TestSMTP(t *testing.T) {
 	done := make(chan bool)
@@ -75,7 +85,7 @@ func TestSMTPNoLog(t *testing.T) {
 func TestSMTPCustomServer(t *testing.T) {
 	cfg := &AppConfig{LogFile: log.OutputOff.String()}
 	sc := ServerConfig{
-		ListenInterface: "127.0.0.1:2526",
+		ListenInterface: mustFreeTCPAddr(t),
 		IsEnabled:       true,
 	}
 	cfg.Servers = append(cfg.Servers, sc)
@@ -95,7 +105,7 @@ func TestSMTPCustomServer(t *testing.T) {
 func TestSMTPCustomBackend(t *testing.T) {
 	cfg := &AppConfig{LogFile: log.OutputOff.String()}
 	sc := ServerConfig{
-		ListenInterface: "127.0.0.1:2526",
+		ListenInterface: mustFreeTCPAddr(t),
 		IsEnabled:       true,
 	}
 	cfg.Servers = append(cfg.Servers, sc)
@@ -119,6 +129,7 @@ func TestSMTPCustomBackend(t *testing.T) {
 
 // with a config from a json file
 func TestSMTPLoadFile(t *testing.T) {
+	addr := mustFreeTCPAddr(t)
 	json := `{
     "log_file" : "./tests/testlog",
     "log_level" : "debug",
@@ -136,7 +147,7 @@ func TestSMTPLoadFile(t *testing.T) {
             "host_name":"mail.guerrillamail.com",
             "max_size": 100017,
             "timeout":160,
-            "listen_interface":"127.0.0.1:2526",
+            "listen_interface":"` + addr + `",
             "max_clients": 2,
 			"tls" : {
 				"private_key_file":"config_test.go",
@@ -149,6 +160,7 @@ func TestSMTPLoadFile(t *testing.T) {
 }
 
 	`
+	addr2 := mustFreeTCPAddr(t)
 	json2 := `{
     "log_file" : "./tests/testlog2",
     "log_level" : "debug",
@@ -166,7 +178,7 @@ func TestSMTPLoadFile(t *testing.T) {
             "host_name":"mail.guerrillamail.com",
             "max_size": 100017,
             "timeout":160,
-            "listen_interface":"127.0.0.1:2526",
+            "listen_interface":"` + addr2 + `",
             "max_clients": 2,
 			"tls" : {
  				"private_key_file":"config_test.go",

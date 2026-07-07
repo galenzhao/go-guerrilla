@@ -52,6 +52,7 @@ type server struct {
 	listener        net.Listener
 	closedListener  chan bool
 	hosts           allowedHosts // stores map[string]bool for faster lookup
+	authStore       atomic.Value // stores *authenticatorHolder
 	state           int
 	// If log changed after a config reload, newLogStore stores the value here until it's safe to change it
 	logStore     atomic.Value
@@ -71,6 +72,7 @@ type command []byte
 var (
 	cmdHELO     command = []byte("HELO")
 	cmdEHLO     command = []byte("EHLO")
+	cmdAUTH     command = []byte("AUTH")
 	cmdHELP     command = []byte("HELP")
 	cmdXCLIENT  command = []byte("XCLIENT")
 	cmdMAIL     command = []byte("MAIL FROM:")
@@ -96,6 +98,7 @@ func newServer(sc *ServerConfig, b backends.Backend, mainlog log.Logger) (*serve
 		state:           ServerStateNew,
 		envelopePool:    mail.NewPool(sc.MaxClients),
 	}
+	server.authStore.Store(&authenticatorHolder{})
 	server.mainlogStore.Store(mainlog)
 	server.backendStore.Store(b)
 	if sc.LogFile == "" {
@@ -117,6 +120,17 @@ func newServer(sc *ServerConfig, b backends.Backend, mainlog log.Logger) (*serve
 		return server, err
 	}
 	return server, nil
+}
+
+func (s *server) setAuthenticator(a Authenticator) {
+	s.authStore.Store(&authenticatorHolder{Authenticator: a})
+}
+
+func (s *server) authenticator() Authenticator {
+	if h, ok := s.authStore.Load().(*authenticatorHolder); ok && h != nil {
+		return h.Authenticator
+	}
+	return nil
 }
 
 func (s *server) configureTLS() error {
@@ -372,24 +386,15 @@ func (s *server) handleClient(client *client) {
 		s.clientPool.GetActiveClientsCount(), time.Now().Format(time.RFC3339))
 
 	helo := fmt.Sprintf("250 %s Hello", sc.Hostname)
-	// ehlo is a multi-line reply and need additional \r\n at the end
-	ehlo := fmt.Sprintf("250-%s Hello\r\n", sc.Hostname)
-
-	// Extended feature advertisements
-	messageSize := fmt.Sprintf("250-SIZE %d\r\n", sc.MaxSize)
-	pipelining := "250-PIPELINING\r\n"
-	advertiseTLS := "250-STARTTLS\r\n"
-	advertiseEnhancedStatusCodes := "250-ENHANCEDSTATUSCODES\r\n"
-	// The last line doesn't need \r\n since string will be printed as a new line.
-	// Also, Last line has no dash -
-	help := "250 HELP"
+	// EHLO extensions are built dynamically per session
+	advertiseTLS := true
 
 	if sc.TLS.AlwaysOn {
 		tlsConfig, ok := s.tlsConfigStore.Load().(*tls.Config)
 		if !ok {
 			s.mainlog().Error("Failed to load *tls.Config")
 		} else if err := client.upgradeToTLS(tlsConfig); err == nil {
-			advertiseTLS = ""
+			advertiseTLS = false
 		} else {
 			s.log().WithError(err).Warnf("[%s] Failed TLS handshake", client.RemoteIP)
 			// server requires TLS, but can't handshake
@@ -398,7 +403,7 @@ func (s *server) handleClient(client *client) {
 	}
 	if !sc.TLS.StartTLSOn {
 		// STARTTLS turned off, don't advertise it
-		advertiseTLS = ""
+		advertiseTLS = false
 	}
 	r := response.Canned
 	for client.isAlive() {
@@ -458,12 +463,147 @@ func (s *server) handleClient(client *client) {
 				}
 				client.ESMTP = true
 				client.resetTransaction()
-				client.sendResponse(ehlo,
-					messageSize,
-					pipelining,
-					advertiseTLS,
-					advertiseEnhancedStatusCodes,
-					help)
+				// Build a strict RFC-style multi-line EHLO response.
+				// Many clients (including Apple Mail) are strict about line formatting.
+				lines := make([]string, 0, 8)
+				lines = append(lines, fmt.Sprintf("250-%s Hello", sc.Hostname))
+				lines = append(lines, fmt.Sprintf("250-SIZE %d", sc.MaxSize))
+				lines = append(lines, "250-PIPELINING")
+				if advertiseTLS {
+					lines = append(lines, "250-STARTTLS")
+				}
+				lines = append(lines, "250-ENHANCEDSTATUSCODES")
+				// Apple Mail and some clients expect AUTH to only be advertised after STARTTLS.
+				// If STARTTLS is available and this session is not yet TLS, don't advertise AUTH.
+				if s.authenticator() != nil && !(sc.TLS.StartTLSOn && !client.TLS) {
+					lines = append(lines, "250-AUTH PLAIN LOGIN")
+				}
+				lines = append(lines, "250 HELP")
+				client.sendResponse(strings.Join(lines, "\r\n"))
+
+			case cmdAUTH.match(cmd):
+				if s.authenticator() == nil {
+					client.sendResponse(r.FailUnrecognizedCmd)
+					break
+				}
+				if client.Authed {
+					client.sendResponse("503 5.5.1 Already authenticated")
+					break
+				}
+				if !client.ESMTP {
+					client.sendResponse("503 5.5.1 AUTH not available")
+					break
+				}
+				if client.isInTransaction() {
+					client.sendResponse("503 5.5.1 Bad sequence of commands")
+					break
+				}
+				fields := bytes.Fields(input)
+				if len(fields) < 2 {
+					client.sendResponse("501 5.5.4 Syntax: AUTH PLAIN [initial-response]")
+					break
+				}
+				mech := strings.ToUpper(string(fields[1]))
+				var identity, username, password string
+				switch mech {
+				case "PLAIN":
+					var ir string
+					if len(fields) >= 3 {
+						ir = string(fields[2])
+					}
+					if ir == "" || ir == "=" {
+						client.sendResponse("334 ")
+						// Flush immediately, then read the base64 response line.
+						if err := s.flushResponse(client); err != nil {
+							client.kill()
+							break
+						}
+						resp, err := s.readCommand(client)
+						if err != nil {
+							client.kill()
+							break
+						}
+						ir = strings.TrimSpace(string(resp))
+						if ir == "*" {
+							client.sendResponse("501 5.5.4 Authentication cancelled")
+							break
+						}
+					}
+					var err error
+					identity, username, password, err = parseAuthPlainIR(ir)
+					if err != nil {
+						client.sendResponse("501 5.5.4 Invalid AUTH PLAIN response")
+						break
+					}
+				case "LOGIN":
+					// AUTH LOGIN [initial-response]
+					// If initial-response is present, it's the username.
+					var userB64 string
+					if len(fields) >= 3 {
+						userB64 = string(fields[2])
+					}
+					if userB64 == "" {
+						client.sendResponse("334 VXNlcm5hbWU6") // "Username:"
+						if err := s.flushResponse(client); err != nil {
+							client.kill()
+							break
+						}
+						resp, err := s.readCommand(client)
+						if err != nil {
+							client.kill()
+							break
+						}
+						userB64 = strings.TrimSpace(string(resp))
+						if userB64 == "*" {
+							client.sendResponse("501 5.5.4 Authentication cancelled")
+							break
+						}
+					}
+					userDecoded, err := decodeBase64Lenient(userB64)
+					if err != nil {
+						client.sendResponse("501 5.5.4 Invalid AUTH LOGIN username")
+						break
+					}
+					username = string(userDecoded)
+
+					client.sendResponse("334 UGFzc3dvcmQ6") // "Password:"
+					if err := s.flushResponse(client); err != nil {
+						client.kill()
+						break
+					}
+					resp, err := s.readCommand(client)
+					if err != nil {
+						client.kill()
+						break
+					}
+					passB64 := strings.TrimSpace(string(resp))
+					if passB64 == "*" {
+						client.sendResponse("501 5.5.4 Authentication cancelled")
+						break
+					}
+					passDecoded, err := decodeBase64Lenient(passB64)
+					if err != nil {
+						client.sendResponse("501 5.5.4 Invalid AUTH LOGIN password")
+						break
+					}
+					password = string(passDecoded)
+				default:
+					client.sendResponse("504 5.5.4 Unrecognized authentication type")
+					break
+				}
+
+				ok, authErr := s.authenticator().AuthenticatePlain(identity, username, password, client.Envelope)
+				if authErr != nil {
+					client.sendResponse("454 4.7.0 Temporary authentication failure")
+					break
+				}
+				if !ok {
+					client.sendResponse("535 5.7.8 Authentication credentials invalid")
+					break
+				}
+				client.Authed = true
+				client.AuthUser = username
+				client.sendResponse("235 2.7.0 Authentication successful")
 
 			case cmdHELP.match(cmd):
 				quote := response.GetQuote()
@@ -515,8 +655,20 @@ func (s *server) handleClient(client *client) {
 					break
 				}
 				s.defaultHost(&to)
-				if (to.IP != nil && !s.allowsIp(to.IP)) || (to.IP == nil && !s.allowsHost(to.Host)) {
-					client.sendResponse(r.ErrorRelayDenied, " ", to.Host)
+				allowed := true
+				if to.IP != nil {
+					allowed = s.allowsIp(to.IP)
+				} else {
+					allowed = s.allowsHost(to.Host)
+				}
+				if !allowed && !client.Authed {
+					// Backwards compatible: if AUTH is not configured, keep relay-denied behavior.
+					// When AUTH is configured, treat this as a relay attempt that requires authentication.
+					if s.authenticator() != nil {
+						client.sendResponse("530 5.7.0 Authentication required")
+					} else {
+						client.sendResponse(r.ErrorRelayDenied, " ", to.Host)
+					}
 				} else {
 					client.PushRcpt(to)
 					rcptError := s.backend().ValidateRcpt(client.Envelope)
@@ -607,11 +759,18 @@ func (s *server) handleClient(client *client) {
 				if !ok {
 					s.mainlog().Error("Failed to load *tls.Config")
 				} else if err := client.upgradeToTLS(tlsConfig); err == nil {
-					advertiseTLS = ""
+					advertiseTLS = false
 					client.resetTransaction()
+					// RFC 3207: after STARTTLS, the client must EHLO/HELO again.
+					// Clear any previous AUTH state.
+					client.Authed = false
+					client.AuthUser = ""
+					client.ESMTP = false
 				} else {
 					s.log().WithError(err).Warnf("[%s] Failed TLS handshake", client.RemoteIP)
-					// Don't disconnect, let the client decide if it wants to continue
+					// If the handshake fails, the stream is no longer in a sane state.
+					// Close to avoid interpreting TLS records as SMTP commands.
+					client.kill()
 				}
 			}
 			// change to command state

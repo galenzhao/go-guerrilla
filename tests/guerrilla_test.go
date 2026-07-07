@@ -59,7 +59,11 @@ var (
 func init() {
 
 	config = &TestConfig{}
-	if err := json.Unmarshal([]byte(configJson), config); err != nil {
+	addr0 := mustFreeTCPAddr()
+	addr1 := mustFreeTCPAddr()
+	cfg := strings.ReplaceAll(configJson, "127.0.0.1:2526", addr0)
+	cfg = strings.ReplaceAll(cfg, "127.0.0.1:4654", addr1)
+	if err := json.Unmarshal([]byte(cfg), config); err != nil {
 		initErr = errors.New("Could not Unmarshal config," + err.Error())
 	} else {
 		logger, _ = log.GetLogger(config.LogFile, "debug")
@@ -71,6 +75,15 @@ func init() {
 		app, initErr = guerrilla.New(&config.AppConfig, backend, logger)
 	}
 
+}
+
+func mustFreeTCPAddr() string {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+	defer func() { _ = l.Close() }()
+	return l.Addr().String()
 }
 
 // a configuration file with a dummy backend
@@ -194,37 +207,49 @@ func TestStart(t *testing.T) {
 	}
 	time.Sleep(time.Second)
 	app.Shutdown()
-	if read, err := ioutil.ReadFile("./testlog"); err == nil {
+	// allow logs to flush (file logger)
+	var read []byte
+	var err error
+	for i := 0; i < 60; i++ {
+		read, err = ioutil.ReadFile("./testlog")
+		if err == nil && strings.Contains(string(read), "Listening on TCP") {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if err == nil {
 		logOutput := string(read)
-		if i := strings.Index(logOutput, "Listening on TCP 127.0.0.1:4654"); i < 0 {
-			t.Error("Server did not listen on 127.0.0.1:4654")
+		addrTLS := config.Servers[1].ListenInterface
+		addrPlain := config.Servers[0].ListenInterface
+		if i := strings.Index(logOutput, "Listening on TCP "+addrTLS); i < 0 {
+			t.Error("Server did not listen on", addrTLS)
 		}
-		if i := strings.Index(logOutput, "Listening on TCP 127.0.0.1:2526"); i < 0 {
-			t.Error("Server did not listen on 127.0.0.1:2526")
+		if i := strings.Index(logOutput, "Listening on TCP "+addrPlain); i < 0 {
+			t.Error("Server did not listen on", addrPlain)
 		}
-		if i := strings.Index(logOutput, "[127.0.0.1:4654] Waiting for a new client"); i < 0 {
-			t.Error("Server did not wait on 127.0.0.1:4654")
+		if i := strings.Index(logOutput, "["+addrTLS+"] Waiting for a new client"); i < 0 {
+			t.Error("Server did not wait on", addrTLS)
 		}
-		if i := strings.Index(logOutput, "[127.0.0.1:2526] Waiting for a new client"); i < 0 {
-			t.Error("Server did not wait on 127.0.0.1:2526")
+		if i := strings.Index(logOutput, "["+addrPlain+"] Waiting for a new client"); i < 0 {
+			t.Error("Server did not wait on", addrPlain)
 		}
-		if i := strings.Index(logOutput, "Server [127.0.0.1:4654] has stopped accepting new clients"); i < 0 {
-			t.Error("Server did not stop on 127.0.0.1:4654")
+		if i := strings.Index(logOutput, "Server ["+addrTLS+"] has stopped accepting new clients"); i < 0 {
+			t.Error("Server did not stop on", addrTLS)
 		}
-		if i := strings.Index(logOutput, "Server [127.0.0.1:2526] has stopped accepting new clients"); i < 0 {
-			t.Error("Server did not stop on 127.0.0.1:2526")
+		if i := strings.Index(logOutput, "Server ["+addrPlain+"] has stopped accepting new clients"); i < 0 {
+			t.Error("Server did not stop on", addrPlain)
 		}
-		if i := strings.Index(logOutput, "shutdown completed for [127.0.0.1:4654]"); i < 0 {
-			t.Error("Server did not complete shutdown on 127.0.0.1:4654")
+		if i := strings.Index(logOutput, "shutdown completed for ["+addrTLS+"]"); i < 0 {
+			t.Error("Server did not complete shutdown on", addrTLS)
 		}
-		if i := strings.Index(logOutput, "shutdown completed for [127.0.0.1:2526]"); i < 0 {
-			t.Error("Server did not complete shutdown on 127.0.0.1:2526")
+		if i := strings.Index(logOutput, "shutdown completed for ["+addrPlain+"]"); i < 0 {
+			t.Error("Server did not complete shutdown on", addrPlain)
 		}
-		if i := strings.Index(logOutput, "shutting down pool [127.0.0.1:4654]"); i < 0 {
-			t.Error("Server did not shutdown pool on 127.0.0.1:4654")
+		if i := strings.Index(logOutput, "shutting down pool ["+addrTLS+"]"); i < 0 {
+			t.Error("Server did not shutdown pool on", addrTLS)
 		}
-		if i := strings.Index(logOutput, "shutting down pool [127.0.0.1:2526]"); i < 0 {
-			t.Error("Server did not shutdown pool on 127.0.0.1:2526")
+		if i := strings.Index(logOutput, "shutting down pool ["+addrPlain+"]"); i < 0 {
+			t.Error("Server did not shutdown pool on", addrPlain)
 		}
 		if i := strings.Index(logOutput, "Backend shutdown completed"); i < 0 {
 			t.Error("Backend didn't shut down")

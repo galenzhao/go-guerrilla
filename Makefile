@@ -7,7 +7,7 @@ BUILD_TIME := $(shell LANG=en_US date +"%F_%T_%z")
 ROOT := github.com/flashmob/go-guerrilla
 LD_FLAGS := -X $(ROOT).Version=$(VERSION) -X $(ROOT).Commit=$(COMMIT) -X $(ROOT).BuildTime=$(BUILD_TIME)
 
-.PHONY: help clean dependencies test
+.PHONY: help clean dependencies test guerrillad guerrilladrace
 help:
 	@echo "Please use \`make <ROOT>' where <ROOT> is one of"
 	@echo "  guerrillad   to build the main binary for current platform"
@@ -15,9 +15,6 @@ help:
 
 clean:
 	rm -f guerrillad
-
-vendor:
-	dep ensure
 
 guerrillad:
 	$(GO_VARS) $(GO) build -o="guerrillad" -ldflags="$(LD_FLAGS)" $(ROOT)/cmd/guerrillad

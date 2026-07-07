@@ -92,6 +92,52 @@ welcome. To encourage more pull requests, we are now offering bounties.
 Take a look at our [Bounties and Roadmap](https://github.com/flashmob/go-guerrilla/wiki/Roadmap-and-Bounties) page!
 
 
+### Use as an outbound SMTP relay (alias reply)
+
+This fork extends go-guerrilla for a **send-only relay** workflow:
+
+1. Catch-all mail (e.g. `support@domain.com` → `all@domain.com`) is handled by your mail provider.
+2. A mail client reads the catch-all mailbox via POP3.
+3. When you **reply**, the client submits SMTP to `guerrillad` on localhost.
+4. `guerrillad` sends via **OCI Email Delivery** or **AWS SES**, rewriting the sender to the original alias (`support@domain.com`).
+
+Two processes are required:
+
+```bash
+# Terminal 1: index new mail from the catch-all POP3 mailbox
+./guerrillad alias-index -c goguerrilla.conf
+
+# Terminal 2: SMTP relay for the mail client
+./guerrillad serve -c goguerrilla.conf
+```
+
+Copy `goguerrilla.conf.sample` to `goguerrilla.conf` and configure:
+
+| Area | Key settings |
+|------|----------------|
+| Alias index | `alias_index_pop3_*`, `alias_db_path`, `alias_index_ttl` (default `180d`) |
+| Reply lookup | `AliasResolve` in `save_process`, `alias_fail_hard: true` |
+| Outbound send | `OCIEmail` or `SES` in `save_process`; `ociemail_source_tmpl: "${hdr_x_guerrilla_reply_as}"` |
+| Mail client | SMTP → `127.0.0.1:2525`; POP3 stays on your provider |
+
+**How alias reply works**
+
+- `alias-index` polls POP3, records only **new** messages (UIDL baseline; no full mailbox backfill).
+- Each indexed message stores `Message-ID → reply_as` (from `To` / `Delivered-To` / `X-Original-To`) in SQLite (`alias.db`).
+- On reply, `AliasResolve` looks up `In-Reply-To` / `References` and injects `X-Guerrilla-Reply-As`.
+- `RewriteFrom` and `OCIEmail`/`SES` use `${hdr_x_guerrilla_reply_as}` as `MAIL FROM`.
+- Replies to mail **before** `alias-index` was enabled, or after TTL expiry, return SMTP `554` with a clear error.
+
+**Commands**
+
+| Command | Purpose |
+|---------|---------|
+| `guerrillad serve` | Start SMTP daemon |
+| `guerrillad alias-index` | Poll POP3 and maintain alias index |
+| `guerrillad version` | Print version |
+
+See `goguerrilla.conf.sample` for a full configuration example.
+
 Getting started
 ===========================
 
@@ -99,11 +145,19 @@ Getting started
 
 #### Dependencies
 
-Go-Guerrilla uses [Dep](https://golang.github.io/dep/) to manage 
-dependencies. If you have dep installed, just run `dep ensure` as usual.
- 
-You can also run `$ go get ./..` if you don't want to use dep, and then run `$ make test`
-to ensure all is good.
+This project uses Go modules. From the repository root:
+
+```bash
+go build -o guerrillad ./cmd/guerrillad
+go test ./...
+```
+
+Or use the Makefile:
+
+```bash
+make guerrillad
+make test
+```
 
 To build the binary run:
 
@@ -155,14 +209,9 @@ Go-Guerrilla can be imported and used as a package in your Go project.
 import (
     "github.com/flashmob/go-guerrilla"
 )
-
-
 ```
 
-You should use the `dep ensure` command to get all dependencies, as Go-Guerrilla uses 
-[dep](https://golang.github.io/dep/) for dependency management. 
-
-Otherise, ``$ go get ./...`` should work if you're in a hurry.
+Run `go mod download` (or `go build ./...`) to fetch dependencies.
 
 #### 2. Start a server
 
@@ -220,6 +269,7 @@ Use as a Daemon
 
 - [guerrillad command](https://github.com/flashmob/go-guerrilla/wiki/Running-from-command-line#guerrillad-command)
     - [Starting](https://github.com/flashmob/go-guerrilla/wiki/Running-from-command-line#starting)
+    - `alias-index` — poll POP3 and build the reply-as alias index (see **Use as an outbound SMTP relay** above)
     - [Re-loading configuration](https://github.com/flashmob/go-guerrilla/wiki/Running-from-command-line#re-loading-the-config)
     - [Re-open logs](https://github.com/flashmob/go-guerrilla/wiki/Running-from-command-line#re-open-log-file)
     - [Examples](https://github.com/flashmob/go-guerrilla/wiki/Running-from-command-line#examples)
@@ -256,6 +306,10 @@ There are a few default _processors_ to get you started.
 |Hasher|Processes each envelope to produce unique hashes to be used for ids later|
 |Header|Add a delivery header to the envelope|
 |HeadersParser|Parses MIME headers and also populates the Subject field of the envelope|
+|AliasResolve|Looks up `In-Reply-To` / `References` in the alias SQLite DB and sets `X-Guerrilla-Reply-As` for reply-as-alias sending|
+|RewriteFrom|Rewrites the message `From:` header using a template (e.g. `${hdr_x_guerrilla_reply_as}`)|
+|SES|Sends mail via AWS SES `SendRawEmail` (optional; skip if `ses_region` is empty)|
+|OCIEmail|Sends mail via Oracle Cloud Email Delivery SMTP (optional; skip if `ociemail_username` is empty)|
 |MySQL|Saves the emails to MySQL.|
 |Redis|Saves the email data to Redis.|
 |GuerrillaDbRedis|A 'monolithic' processor used at Guerrilla Mail; included for example

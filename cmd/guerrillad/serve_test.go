@@ -5,9 +5,11 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"math"
+	"net"
 	"os"
 	"os/exec"
 	"runtime"
@@ -24,6 +26,36 @@ import (
 	"github.com/flashmob/go-guerrilla/tests/testcert"
 	"github.com/spf13/cobra"
 )
+
+var (
+	testLogPath  = "../../tests/testlog_cmd_guerrillad"
+	testLogPath2 = "../../tests/testlog2_cmd_guerrillad"
+)
+
+func init() {
+	// Avoid cross-package test interference by using dedicated log files.
+	configJsonA = strings.ReplaceAll(configJsonA, "../../tests/testlog2", testLogPath2)
+	configJsonB = strings.ReplaceAll(configJsonB, "../../tests/testlog2", testLogPath2)
+	configJsonC = strings.ReplaceAll(configJsonC, "../../tests/testlog2", testLogPath2)
+	configJsonD = strings.ReplaceAll(configJsonD, "../../tests/testlog2", testLogPath2)
+	configJsonE = strings.ReplaceAll(configJsonE, "../../tests/testlog2", testLogPath2)
+
+	configJsonA = strings.ReplaceAll(configJsonA, "../../tests/testlog", testLogPath)
+	configJsonB = strings.ReplaceAll(configJsonB, "../../tests/testlog", testLogPath)
+	configJsonC = strings.ReplaceAll(configJsonC, "../../tests/testlog", testLogPath)
+	configJsonD = strings.ReplaceAll(configJsonD, "../../tests/testlog", testLogPath)
+	configJsonE = strings.ReplaceAll(configJsonE, "../../tests/testlog", testLogPath)
+}
+
+func mustFreeTCPPort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to get free port: %v", err)
+	}
+	defer func() { _ = l.Close() }()
+	return l.Addr().(*net.TCPAddr).Port
+}
 
 var configJsonA = `
 {
@@ -331,7 +363,12 @@ func Round(x float64) float64 {
 
 // exponentialBackoff sleeps in nanoseconds, according to this formula 2^(i-1) * 25 / 2
 func exponentialBackoff(i int) {
-	time.Sleep(time.Duration(Round(math.Pow(3.0, float64(i))-1.0)*100.0/2.0) * time.Millisecond)
+	d := time.Duration(Round(math.Pow(3.0, float64(i))-1.0)*100.0/2.0) * time.Millisecond
+	// Cap backoff to keep test suite bounded.
+	if d > 2*time.Second {
+		d = 2 * time.Second
+	}
+	time.Sleep(d)
 }
 
 var grepNotFound error
@@ -342,10 +379,9 @@ var grepNotFound error
 // error otherwise
 //
 // It will attempt to search the log multiple times, pausing loner for each re-try
-//
 func grepTestlog(match string, lineNumber int) (found int, err error) {
 	found = 0
-	fd, err := os.Open("../../tests/testlog")
+	fd, err := os.Open(testLogPath)
 	if err != nil {
 		return found, err
 	}
@@ -355,7 +391,7 @@ func grepTestlog(match string, lineNumber int) (found int, err error) {
 	buff := bufio.NewReader(fd)
 	var ln int
 	var line string
-	for tries := 0; tries < 6; tries++ {
+	for tries := 0; tries < 8; tries++ {
 		//fmt.Println("try..", tries)
 		for {
 			ln++
@@ -385,7 +421,7 @@ func grepTestlog(match string, lineNumber int) (found int, err error) {
 		_ = mainlog.Reopen()
 
 		// re-open
-		fd, err = os.OpenFile("../../tests/testlog", os.O_RDONLY, 0644)
+		fd, err = os.OpenFile(testLogPath, os.O_RDONLY, 0644)
 		if err != nil {
 			return found, err
 		}
@@ -415,7 +451,7 @@ func TestFileLimit(t *testing.T) {
 }
 
 func getTestLog() (mainlog log.Logger, err error) {
-	return log.GetLogger("../../tests/testlog", "debug")
+	return log.GetLogger(testLogPath, "debug")
 }
 
 func truncateIfExists(filename string) error {
@@ -433,11 +469,11 @@ func deleteIfExists(filename string) error {
 
 func cleanTestArtifacts(t *testing.T) {
 
-	if err := truncateIfExists("../../tests/testlog"); err != nil {
-		t.Error("could not clean tests/testlog:", err)
+	if err := truncateIfExists(testLogPath); err != nil {
+		t.Error("could not clean testlog:", err)
 	}
-	if err := truncateIfExists("../../tests/testlog2"); err != nil {
-		t.Error("could not clean tests/testlog2:", err)
+	if err := truncateIfExists(testLogPath2); err != nil {
+		t.Error("could not clean testlog2:", err)
 	}
 
 	letters := []byte{'A', 'B', 'C', 'D', 'E'}
@@ -633,6 +669,10 @@ func TestServe(t *testing.T) {
 // then connect to it & HELO.
 func TestServerAddEvent(t *testing.T) {
 	var err error
+	dynMainPort := mustFreeTCPPort(t)
+	dynMainAddr := fmt.Sprintf("127.0.0.1:%d", dynMainPort)
+	dynNewPort := mustFreeTCPPort(t)
+	dynNewAddr := fmt.Sprintf("127.0.0.1:%d", dynNewPort)
 	err = testcert.GenerateCert("mail2.guerrillamail.com", "", 365*24*time.Hour, false, 2048, "P256", "../../tests/")
 	if err != nil {
 		t.Error("failed to generate a test certificate", err)
@@ -645,7 +685,8 @@ func TestServerAddEvent(t *testing.T) {
 		t.FailNow()
 	}
 	// start the server by emulating the serve command
-	if err := ioutil.WriteFile("configJsonA.json", []byte(configJsonA), 0644); err != nil {
+	cfgA := strings.ReplaceAll(configJsonA, "127.0.0.1:3536", dynMainAddr)
+	if err := ioutil.WriteFile("configJsonA.json", []byte(cfgA), 0644); err != nil {
 		t.Error(err)
 		t.FailNow()
 	}
@@ -656,18 +697,18 @@ func TestServerAddEvent(t *testing.T) {
 	}()
 
 	// allow the server to start
-	if _, err := grepTestlog("Listening on TCP 127.0.0.1:3536", 0); err != nil {
+	if _, err := grepTestlog("Listening on TCP "+dynMainAddr, 0); err != nil {
 		t.Error("server didn't start")
 	}
 
 	// now change the config by adding a server
-	conf := &guerrilla.AppConfig{}       // blank one
-	err = conf.Load([]byte(configJsonA)) // load configJsonA
+	conf := &guerrilla.AppConfig{} // blank one
+	err = conf.Load([]byte(cfgA))  // load configJsonA
 	if err != nil {
 		t.Error(err)
 	}
 	newServer := conf.Servers[0]                         // copy the first server config
-	newServer.ListenInterface = "127.0.0.1:2526"         // change it
+	newServer.ListenInterface = dynNewAddr               // change it
 	newConf := conf                                      // copy the cmdConfg
 	newConf.Servers = append(newConf.Servers, newServer) // add the new server
 	if jsonbytes, err := json.Marshal(newConf); err == nil {
@@ -677,7 +718,7 @@ func TestServerAddEvent(t *testing.T) {
 	}
 	// send a sighup signal to the server
 	sigHup()
-	if _, err := grepTestlog("[127.0.0.1:2526] Waiting for a new client", 0); err != nil {
+	if _, err := grepTestlog("["+dynNewAddr+"] Waiting for a new client", 0); err != nil {
 		t.Error("new server didn't start")
 	}
 
@@ -698,8 +739,8 @@ func TestServerAddEvent(t *testing.T) {
 	d.Shutdown()
 
 	// did backend started as expected?
-	if _, err := grepTestlog("New server added [127.0.0.1:2526]", 0); err != nil {
-		t.Error("Did not add server [127.0.0.1:2526] after sighup")
+	if _, err := grepTestlog("New server added", 0); err != nil {
+		t.Error("Did not add server after sighup")
 	}
 
 	if _, err := grepTestlog("Backend shutdown completed", 0); err != nil {
@@ -715,6 +756,12 @@ func TestServerAddEvent(t *testing.T) {
 // then connect to 127.0.0.1:2228 & HELO.
 func TestServerStartEvent(t *testing.T) {
 	var err error
+	dynMainPort := mustFreeTCPPort(t)
+	dynMainAddr := fmt.Sprintf("127.0.0.1:%d", dynMainPort)
+	dynPort := mustFreeTCPPort(t)
+	dynAddr := fmt.Sprintf("127.0.0.1:%d", dynPort)
+	cfgA := strings.ReplaceAll(configJsonA, "127.0.0.1:3536", dynMainAddr)
+	cfgA = strings.ReplaceAll(cfgA, "127.0.0.1:2228", dynAddr)
 	err = testcert.GenerateCert("mail2.guerrillamail.com", "", 365*24*time.Hour, false, 2048, "P256", "../../tests/")
 	if err != nil {
 		t.Error("failed to generate a test certificate", err)
@@ -727,7 +774,7 @@ func TestServerStartEvent(t *testing.T) {
 		t.FailNow()
 	}
 
-	if err := ioutil.WriteFile("configJsonA.json", []byte(configJsonA), 0644); err != nil {
+	if err := ioutil.WriteFile("configJsonA.json", []byte(cfgA), 0644); err != nil {
 		t.Error(err)
 		t.FailNow()
 	}
@@ -736,12 +783,12 @@ func TestServerStartEvent(t *testing.T) {
 	go func() {
 		serve(cmd, []string{})
 	}()
-	if _, err := grepTestlog("Listening on TCP 127.0.0.1:3536", 0); err != nil {
+	if _, err := grepTestlog("Listening on TCP "+dynMainAddr, 0); err != nil {
 		t.Error("server didn't start")
 	}
 	// now change the config by adding a server
-	conf := &guerrilla.AppConfig{}                        // blank one
-	if err = conf.Load([]byte(configJsonA)); err != nil { // load configJsonA
+	conf := &guerrilla.AppConfig{}                 // blank one
+	if err = conf.Load([]byte(cfgA)); err != nil { // load configJsonA
 		t.Error(err)
 	}
 	newConf := conf // copy the cmdConfg
@@ -758,7 +805,7 @@ func TestServerStartEvent(t *testing.T) {
 	sigHup()
 
 	// see if the new server started?
-	if _, err := grepTestlog("Listening on TCP 127.0.0.1:2228", 0); err != nil {
+	if _, err := grepTestlog("Listening on TCP "+dynAddr, 0); err != nil {
 		t.Error("second server didn't start")
 	}
 
@@ -795,6 +842,12 @@ func TestServerStartEvent(t *testing.T) {
 
 func TestServerStopEvent(t *testing.T) {
 	var err error
+	dynMainPort := mustFreeTCPPort(t)
+	dynMainAddr := fmt.Sprintf("127.0.0.1:%d", dynMainPort)
+	dynPort := mustFreeTCPPort(t)
+	dynAddr := fmt.Sprintf("127.0.0.1:%d", dynPort)
+	cfgA := strings.ReplaceAll(configJsonA, "127.0.0.1:3536", dynMainAddr)
+	cfgA = strings.ReplaceAll(cfgA, "127.0.0.1:2228", dynAddr)
 	err = testcert.GenerateCert("mail2.guerrillamail.com", "", 365*24*time.Hour, false, 2048, "P256", "../../tests/")
 	if err != nil {
 		t.Error("failed to generate a test certificate", err)
@@ -806,7 +859,7 @@ func TestServerStopEvent(t *testing.T) {
 		t.Error("could not get logger,", err)
 		t.FailNow()
 	}
-	if err := ioutil.WriteFile("configJsonA.json", []byte(configJsonA), 0644); err != nil {
+	if err := ioutil.WriteFile("configJsonA.json", []byte(cfgA), 0644); err != nil {
 		t.Error(err)
 		t.FailNow()
 	}
@@ -817,12 +870,12 @@ func TestServerStopEvent(t *testing.T) {
 		serve(cmd, []string{})
 	}()
 	// allow the server to start
-	if _, err := grepTestlog("Listening on TCP 127.0.0.1:3536", 0); err != nil {
+	if _, err := grepTestlog("Listening on TCP "+dynMainAddr, 0); err != nil {
 		t.Error("server didn't start")
 	}
 	// now change the config by enabling a server
-	conf := &guerrilla.AppConfig{}                        // blank one
-	if err = conf.Load([]byte(configJsonA)); err != nil { // load configJsonA
+	conf := &guerrilla.AppConfig{}                 // blank one
+	if err = conf.Load([]byte(cfgA)); err != nil { // load configJsonA
 		t.Error(err)
 	}
 	newConf := conf                     // copy the cmdConfg
@@ -838,7 +891,7 @@ func TestServerStopEvent(t *testing.T) {
 	// send a sighup signal to the server
 	sigHup()
 	// detect config change
-	if _, err := grepTestlog("Listening on TCP 127.0.0.1:2228", 0); err != nil {
+	if _, err := grepTestlog("Listening on TCP "+dynAddr, 0); err != nil {
 		t.Error("new server didn't start")
 	}
 
@@ -871,13 +924,13 @@ func TestServerStopEvent(t *testing.T) {
 	// send a sighup signal to the server
 	sigHup()
 	// detect config change
-	if _, err := grepTestlog("Server [127.0.0.1:2228] has stopped accepting new clients", 27); err != nil {
-		t.Error("127.0.0.1:2228 did not stop")
+	if _, err := grepTestlog("Server ["+dynAddr+"] has stopped accepting new clients", 27); err != nil {
+		t.Error(dynAddr, "did not stop")
 	}
 
 	// it should not connect to the server
 	if _, _, err := test.Connect(newConf.Servers[1], 20); err == nil {
-		t.Error("127.0.0.1:2228 was disabled, but still accepting connections", newConf.Servers[1].ListenInterface)
+		t.Error(dynAddr, "was disabled, but still accepting connections", newConf.Servers[1].ListenInterface)
 	}
 	// shutdown wait for exit
 	d.Shutdown()

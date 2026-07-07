@@ -38,6 +38,10 @@ type client struct {
 	ID          uint64
 	ConnectedAt time.Time
 	KilledAt    time.Time
+	// Authed is true when SMTP AUTH succeeded for this session.
+	Authed bool
+	// AuthUser is the authenticated username (AUTH PLAIN authcid).
+	AuthUser string
 	// Number of errors encountered during session with this client
 	errors       int
 	state        ClientState
@@ -171,6 +175,8 @@ func (c *client) init(conn net.Conn, clientID uint64, ep *mail.Pool) {
 	c.ConnectedAt = time.Now()
 	c.ID = clientID
 	c.errors = 0
+	c.Authed = false
+	c.AuthUser = ""
 	// borrow an envelope from the envelope pool
 	c.Envelope = ep.Borrow(getRemoteAddr(conn), clientID)
 }

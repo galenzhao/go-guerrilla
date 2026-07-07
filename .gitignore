@@ -1,6 +1,14 @@
 .idea
 goguerrilla.conf
 goguerrilla.conf.json
+goguerrilla.conf.api
+/ses_accessKeys.csv
+/.gopath/
+*.pid
+/tests/testlog*
+/alias.db
+/backends/test_ociemail*.log
 /guerrillad
 vendor
 go-guerrilla.wiki
+certs/

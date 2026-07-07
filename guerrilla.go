@@ -42,6 +42,7 @@ type Guerrilla interface {
 	Publish(topic Event, args ...interface{})
 	Unsubscribe(topic Event, handler interface{}) error
 	SetLogger(log.Logger)
+	SetAuthenticator(Authenticator)
 }
 
 type guerrilla struct {
@@ -53,6 +54,7 @@ type guerrilla struct {
 	EventHandler
 	logStore
 	backendStore
+	authStore atomic.Value // stores *authenticatorHolder
 }
 
 type logStore struct {
@@ -88,6 +90,7 @@ func New(ac *AppConfig, b backends.Backend, l log.Logger) (Guerrilla, error) {
 	}
 	g.backendStore.Store(b)
 	g.setMainlog(l)
+	g.authStore.Store(&authenticatorHolder{})
 
 	if ac.LogLevel != "" {
 		if h, ok := l.(*log.HookedLogger); ok {
@@ -118,6 +121,20 @@ func New(ac *AppConfig, b backends.Backend, l log.Logger) (Guerrilla, error) {
 	return g, err
 }
 
+func (g *guerrilla) SetAuthenticator(a Authenticator) {
+	g.authStore.Store(&authenticatorHolder{Authenticator: a})
+	g.mapServers(func(s *server) {
+		s.setAuthenticator(a)
+	})
+}
+
+func (g *guerrilla) authenticator() Authenticator {
+	if h, ok := g.authStore.Load().(*authenticatorHolder); ok && h != nil {
+		return h.Authenticator
+	}
+	return nil
+}
+
 // Instantiate servers
 func (g *guerrilla) makeServers() error {
 	g.mainlog().Debug("making servers")
@@ -141,6 +158,7 @@ func (g *guerrilla) makeServers() error {
 			if server != nil {
 				g.servers[sc.ListenInterface] = server
 				server.setAllowedHosts(g.Config.AllowedHosts)
+				server.setAuthenticator(g.authenticator())
 			}
 		}
 	}

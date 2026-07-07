@@ -1,21 +1,59 @@
 {
     "log_file" : "stderr",
     "log_level" : "info",
-    "allowed_hosts": [
-      "guerrillamail.com",
-      "guerrillamailblock.com",
-      "sharklasers.com",
-      "guerrillamail.net",
-      "guerrillamail.org"
-    ],
+    "allowed_hosts": ["."],
+    "auth": {
+        "enabled": false,
+        "type": "http",
+        "url": "http://127.0.0.1:8080/auth",
+        "timeout": "2s",
+        "headers": {
+            "X-Auth-Token": "change-me"
+        }
+    },
     "pid_file" : "/var/run/go-guerrilla.pid",
     "backend_config": {
         "log_received_mails": true,
         "save_workers_size": 1,
-        "save_process" : "HeadersParser|Header|Debugger",
+        "save_process" : "HeadersParser|AliasResolve|RewriteFrom|Header|OCIEmail|Debugger",
         "primary_mail_host" : "mail.example.com",
         "gw_save_timeout" : "30s",
-        "gw_val_rcpt_timeout" : "3s"
+        "gw_val_rcpt_timeout" : "3s",
+
+        "alias_db_path": "./alias.db",
+        "alias_fail_hard": true,
+        "alias_index_ttl": "180d",
+        "alias_index_max_rows": 100000,
+        "alias_index_purge_interval": "1h",
+        "alias_index_poll_interval": "60s",
+        "alias_index_skip_existing_on_start": true,
+        "alias_index_pop3_host": "pop.example.com",
+        "alias_index_pop3_port": 995,
+        "alias_index_pop3_tls": true,
+        "alias_index_pop3_user": "all@example.com",
+        "alias_index_pop3_password": "change-me",
+
+        "ses_region": "us-east-1",
+        "ses_timeout": "10s",
+        "ses_fail_hard": false,
+        "ses_source_tmpl": "${hdr_from}",
+        "ses_to_tmpl": "${rcpt_to}",
+        "ses_include_delivery_header": true,
+        "ses_max_bytes": 10485760,
+
+        "ses_access_key_id": "change-me-or-leave-empty",
+        "ses_secret_access_key": "change-me-or-leave-empty",
+
+        "ociemail_region": "us-phoenix-1",
+        "ociemail_port": 587,
+        "ociemail_timeout": "10s",
+        "ociemail_fail_hard": false,
+        "ociemail_source_tmpl": "${hdr_x_guerrilla_reply_as}",
+        "ociemail_to_tmpl": "${rcpt_to}",
+        "ociemail_include_delivery_header": true,
+        "ociemail_max_bytes": 2097152,
+        "ociemail_username": "ocid1.user.oc1..aaaa...",
+        "ociemail_password": "change-me"
     },
     "servers" : [
         {
