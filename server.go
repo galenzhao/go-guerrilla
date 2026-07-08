@@ -592,17 +592,18 @@ func (s *server) handleClient(client *client) {
 					break
 				}
 
-				ok, authErr := s.authenticator().AuthenticatePlain(identity, username, password, client.Envelope)
+				authResult, authErr := s.authenticator().AuthenticatePlain(identity, username, password, client.Envelope)
 				if authErr != nil {
 					client.sendResponse("454 4.7.0 Temporary authentication failure")
 					break
 				}
-				if !ok {
+				if !authResult.OK {
 					client.sendResponse("535 5.7.8 Authentication credentials invalid")
 					break
 				}
 				client.Authed = true
 				client.AuthUser = username
+				client.AuthTenant = authResult.Tenant
 				client.sendResponse("235 2.7.0 Authentication successful")
 
 			case cmdHELP.match(cmd):
@@ -742,6 +743,10 @@ func (s *server) handleClient(client *client) {
 				break
 			}
 
+			if client.Authed && client.AuthTenant != nil {
+				backends.SetEnvelopeTenantSend(client.Envelope, client.AuthTenant)
+			}
+
 			res := s.backend().Process(client.Envelope)
 			if res.Code() < 300 {
 				client.messagesSent++
@@ -765,6 +770,7 @@ func (s *server) handleClient(client *client) {
 					// Clear any previous AUTH state.
 					client.Authed = false
 					client.AuthUser = ""
+					client.AuthTenant = nil
 					client.ESMTP = false
 				} else {
 					s.log().WithError(err).Warnf("[%s] Failed TLS handshake", client.RemoteIP)

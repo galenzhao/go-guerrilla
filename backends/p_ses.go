@@ -43,7 +43,7 @@ func init() {
 }
 
 type sesConfig struct {
-	Region                string `json:"ses_region"`
+	Region                string `json:"ses_region,omitempty"`
 	Timeout               string `json:"ses_timeout,omitempty"`
 	FailHard              bool   `json:"ses_fail_hard,omitempty"`
 	SourceTmpl            string `json:"ses_source_tmpl"`
@@ -71,26 +71,19 @@ var newSESClient = func(sess *session.Session) sesAPI {
 
 func SES() Decorator {
 	var sender *sesSender
+	tenantOnly := false
 
 	Svc.AddInitializer(InitializeWith(func(backendConfig BackendConfig) error {
-		region, _ := backendConfig["ses_region"].(string)
-		if strings.TrimSpace(region) == "" {
-			// SES not configured; skip when using another outbound processor (eg OCIEmail).
-			return nil
-		}
-
 		configType := BaseConfig(&sesConfig{})
 		bcfg, err := Svc.ExtractConfig(backendConfig, configType)
 		if err != nil {
 			return err
 		}
-
 		cfg := bcfg.(*sesConfig)
-		if strings.TrimSpace(cfg.SourceTmpl) == "" {
-			return fmt.Errorf("ses_source_tmpl is required")
-		}
-		if strings.TrimSpace(cfg.ToTmpl) == "" {
-			return fmt.Errorf("ses_to_tmpl is required")
+
+		if cfg.MaxBytes <= 0 {
+			// SES raw email maximum is 10MB; keep this as a safe default.
+			cfg.MaxBytes = 10 * 1024 * 1024
 		}
 
 		timeout := time.Second * 10
@@ -102,9 +95,30 @@ func SES() Decorator {
 			timeout = d
 		}
 
-		if cfg.MaxBytes <= 0 {
-			// SES raw email maximum is 10MB; keep this as a safe default.
-			cfg.MaxBytes = 10 * 1024 * 1024
+		// With tenant_registry, local SES credentials are ignored; send only via tenant config.
+		if GlobalTenantRegistry() != nil {
+			if strings.TrimSpace(cfg.SourceTmpl) == "" {
+				return fmt.Errorf("ses_source_tmpl is required")
+			}
+			if strings.TrimSpace(cfg.ToTmpl) == "" {
+				return fmt.Errorf("ses_to_tmpl is required")
+			}
+			tenantOnly = true
+			sender = &sesSender{cfg: cfg}
+			Log().Info("SES using tenant_registry credentials only (local ses_* credentials ignored)")
+			return nil
+		}
+
+		region, _ := backendConfig["ses_region"].(string)
+		if strings.TrimSpace(region) == "" {
+			// SES not configured; skip when using another outbound processor (eg OCIEmail).
+			return nil
+		}
+		if strings.TrimSpace(cfg.SourceTmpl) == "" {
+			return fmt.Errorf("ses_source_tmpl is required")
+		}
+		if strings.TrimSpace(cfg.ToTmpl) == "" {
+			return fmt.Errorf("ses_to_tmpl is required")
 		}
 
 		awsCfg := aws.NewConfig().
@@ -136,7 +150,7 @@ func SES() Decorator {
 			if task != TaskSaveMail {
 				return p.Process(e, task)
 			}
-			if sender == nil || sender.client == nil || sender.cfg == nil {
+			if sender == nil || sender.cfg == nil || (!tenantOnly && sender.client == nil) {
 				err := fmt.Errorf("ses processor not initialized")
 				if sender != nil && sender.cfg != nil && !sender.cfg.FailHard {
 					Log().WithError(err).Warn("SES not initialized; skipping send")
@@ -146,55 +160,80 @@ func SES() Decorator {
 			}
 
 			vars := makeSESVars(e)
-			source := strings.TrimSpace(applySESTemplate(sender.cfg.SourceTmpl, vars))
+			activeCfg := sender.cfg
+			tenant := GetEnvelopeTenantSend(e)
+			if tenantOnly && tenant == nil {
+				err := fmt.Errorf("tenant_registry is configured; tenant send credentials are required")
+				if activeCfg.FailHard {
+					return NewResult(response.Canned.FailBackendTransaction, response.SP, err), err
+				}
+				Log().WithError(err).Warn("SES missing tenant credentials; skipping send")
+				return p.Process(e, task)
+			}
+			if tenant != nil {
+				if tenant.Provider != "ses" {
+					err := fmt.Errorf("tenant %s provider %q does not match SES processor", tenant.TenantID, tenant.Provider)
+					if activeCfg.FailHard {
+						return NewResult(response.Canned.FailBackendTransaction, response.SP, err), err
+					}
+					Log().WithError(err).Warn("SES tenant provider mismatch; skipping send")
+					return p.Process(e, task)
+				}
+			}
+
+			source := strings.TrimSpace(applySESTemplate(activeCfg.SourceTmpl, vars))
 			source = normalizeEmailAddress(source)
-			dests := splitAddresses(applySESTemplate(sender.cfg.ToTmpl, vars))
+			dests := splitAddresses(applySESTemplate(activeCfg.ToTmpl, vars))
 
 			if source == "" || len(dests) == 0 {
 				err := fmt.Errorf("ses template produced empty source or destinations")
-				if sender.cfg.FailHard {
+				if activeCfg.FailHard {
 					return NewResult(response.Canned.FailBackendTransaction, response.SP, err), err
 				}
 				Log().WithError(err).Warn("SES template invalid; skipping send")
 				return p.Process(e, task)
 			}
 
-			raw, rerr := buildRawMessage(e, sender.cfg.IncludeDeliveryHeader)
+			raw, rerr := buildRawMessage(e, activeCfg.IncludeDeliveryHeader)
 			if rerr != nil {
-				if sender.cfg.FailHard {
+				if activeCfg.FailHard {
 					return NewResult(response.Canned.FailBackendTransaction, response.SP, rerr), rerr
 				}
 				Log().WithError(rerr).Warn("SES raw message build failed; skipping send")
 				return p.Process(e, task)
 			}
-			if len(raw) > sender.cfg.MaxBytes {
-				err := fmt.Errorf("ses raw message too large: %d bytes > %d", len(raw), sender.cfg.MaxBytes)
-				if sender.cfg.FailHard {
+			if len(raw) > activeCfg.MaxBytes {
+				err := fmt.Errorf("ses raw message too large: %d bytes > %d", len(raw), activeCfg.MaxBytes)
+				if activeCfg.FailHard {
 					return NewResult(response.Canned.FailBackendTransaction, response.SP, err), err
 				}
 				Log().WithError(err).Warn("SES message too large; skipping send")
 				return p.Process(e, task)
 			}
 
-			input := &ses.SendRawEmailInput{
-				RawMessage:   &ses.RawMessage{Data: raw},
-				Source:       aws.String(source),
-				Destinations: aws.StringSlice(dests),
-			}
-
 			ctx := context.Background()
 			// Note: HTTPClient timeout already enforces an upper bound; context here is a best-effort guard.
-			if strings.TrimSpace(sender.cfg.Timeout) != "" {
-				if d, err := time.ParseDuration(strings.TrimSpace(sender.cfg.Timeout)); err == nil && d > 0 {
+			if strings.TrimSpace(activeCfg.Timeout) != "" {
+				if d, err := time.ParseDuration(strings.TrimSpace(activeCfg.Timeout)); err == nil && d > 0 {
 					var cancel context.CancelFunc
 					ctx, cancel = context.WithTimeout(ctx, d)
 					defer cancel()
 				}
 			}
 
-			_, err := sender.client.SendRawEmailWithContext(ctx, input)
+			var err error
+			if tenant != nil {
+				err = SendViaTenantSES(ctx, tenant, activeCfg, source, dests, raw)
+			} else {
+				input := &ses.SendRawEmailInput{
+					RawMessage:   &ses.RawMessage{Data: raw},
+					Source:       aws.String(source),
+					Destinations: aws.StringSlice(dests),
+				}
+				_, err = sender.client.SendRawEmailWithContext(ctx, input)
+			}
 			if err != nil {
-				if sender.cfg.FailHard {
+				if activeCfg.FailHard {
 					return NewResult(response.Canned.FailBackendTransaction, response.SP, err), err
 				}
 				Log().WithError(err).Warn("SES send failed; continuing")

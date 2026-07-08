@@ -1,6 +1,60 @@
 package backends
 
-import "testing"
+import (
+	"context"
+	"testing"
+	"time"
+)
+
+type stubPOP3Registry struct {
+	accounts []TaggedPOP3Account
+}
+
+func (s *stubPOP3Registry) Refresh(context.Context) error { return nil }
+func (s *stubPOP3Registry) All() []Tenant                 { return nil }
+func (s *stubPOP3Registry) Get(string) (*Tenant, bool)    { return nil, false }
+func (s *stubPOP3Registry) POP3Accounts() []TaggedPOP3Account {
+	out := make([]TaggedPOP3Account, len(s.accounts))
+	copy(out, s.accounts)
+	return out
+}
+func (s *stubPOP3Registry) PollInterval() time.Duration { return time.Minute }
+
+func TestAliasIndexerIgnoresStaticAccountsWhenRegistrySet(t *testing.T) {
+	reg := &stubPOP3Registry{
+		accounts: []TaggedPOP3Account{{
+			TenantID: "acme",
+			Account: AliasPOP3Account{
+				Host:     "pop.registry.example.com",
+				Port:     995,
+				TLS:      true,
+				User:     "reg@acme.com",
+				Password: "pw",
+				TenantID: "acme",
+			},
+		}},
+	}
+	indexer := &AliasIndexer{
+		cfg: AliasIndexerConfig{
+			Accounts: []AliasPOP3Account{{
+				Host: "pop.static.example.com",
+				User: "static@example.com",
+			}},
+			Registry: reg,
+		},
+	}
+	got := indexer.currentAccounts()
+	if len(got) != 1 || got[0].Host != "pop.registry.example.com" {
+		t.Fatalf("expected registry accounts only, got %+v", got)
+	}
+
+	// Empty registry must not fall back to static accounts.
+	reg.accounts = nil
+	got = indexer.currentAccounts()
+	if len(got) != 0 {
+		t.Fatalf("expected no fallback to static accounts, got %+v", got)
+	}
+}
 
 func TestParseAliasPOP3AccountsList(t *testing.T) {
 	cfg := BackendConfig{

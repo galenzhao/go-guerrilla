@@ -1,14 +1,17 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/flashmob/go-guerrilla"
+	"github.com/flashmob/go-guerrilla/backends"
 	"github.com/flashmob/go-guerrilla/log"
 
 	// enable the Redis redigo driver
@@ -41,6 +44,9 @@ var (
 	mainlog       log.Logger
 
 	d guerrilla.Daemon
+
+	registryDone   = make(chan struct{})
+	registryPoller sync.Once
 )
 
 func init() {
@@ -77,6 +83,7 @@ func sigHandler() {
 			if ac, err := readConfig(configPath, pidFile); err == nil {
 				_ = d.ReloadConfig(*ac)
 				applyAuthenticator(ac)
+				applyTenantRegistry(ac)
 			} else {
 				mainlog.WithError(err).Error("Could not reload config")
 			}
@@ -113,6 +120,7 @@ func serve(cmd *cobra.Command, args []string) {
 	}
 	_ = d.SetConfig(*c)
 	applyAuthenticator(c)
+	applyTenantRegistry(c)
 
 	// Check that max clients is not greater than system open file limit.
 	if ok, maxClients, fileLimit := guerrilla.CheckFileLimit(c); !ok {
@@ -144,6 +152,29 @@ func applyAuthenticator(c *guerrilla.AppConfig) {
 		return
 	}
 	d.SetAuthenticator(authenticator)
+}
+
+func applyTenantRegistry(c *guerrilla.AppConfig) {
+	if c == nil {
+		backends.SetGlobalTenantRegistry(nil)
+		return
+	}
+	registry, err := guerrilla.NewTenantRegistryFromConfig(c.TenantRegistry)
+	if err != nil {
+		mainlog.WithError(err).Error("failed to initialize tenant registry")
+		return
+	}
+	backends.SetGlobalTenantRegistry(registry)
+	if registry != nil {
+		registryPoller.Do(func() {
+			guerrilla.StartTenantRegistryPoller(registry, registryDone)
+		})
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := registry.Refresh(ctx); err != nil {
+			mainlog.WithError(err).Warn("tenant registry refresh failed")
+		}
+	}
 }
 
 // ReadConfig is called at startup, or when a SIG_HUP is caught

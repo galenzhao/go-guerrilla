@@ -139,6 +139,94 @@ func TestOCIEmailProcessorFailHard(t *testing.T) {
 	}
 }
 
+func TestOCIEmailTenantOnlyRequiresTenant(t *testing.T) {
+	defer Svc.reset()
+	defer SetGlobalTenantRegistry(nil)
+
+	SetGlobalTenantRegistry(&stubTenantRegistry{tenants: map[string]Tenant{}})
+
+	origNewSender := newOCIEmailSender
+	defer func() { newOCIEmailSender = origNewSender }()
+	fake := &fakeOCIEmailSender{}
+	newOCIEmailSender = func(_ *ociemailConfig) ociemailSenderAPI { return fake }
+
+	l, _ := log.GetLogger("./test_ociemail_tenant_only.log", "debug")
+	g, err := New(BackendConfig{
+		"save_process":         "HeadersParser|Header|OCIEmail",
+		"primary_mail_host":    "mail.example.com",
+		"ociemail_source_tmpl": "${hdr_from}",
+		"ociemail_to_tmpl":     "${rcpt_to}",
+		"ociemail_fail_hard":   true,
+	}, l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = g.Shutdown() }()
+
+	e := mail.NewEnvelope("127.0.0.1", 1)
+	e.RcptTo = append(e.RcptTo, mail.Address{User: "bob", Host: "rcpt.example"})
+	_, _ = e.Data.WriteString("From: support@domain.example\r\nSubject: Hello\r\n\r\nBody")
+
+	res := g.Process(e)
+	if res.Code() < 400 {
+		t.Fatalf("expected failure without tenant credentials, got: %v", res)
+	}
+	if fake.lastReq != nil {
+		t.Fatal("local OCI sender must not be used when tenant_registry is configured")
+	}
+}
+
+func TestOCIEmailTenantOnlyUsesTenantCredentials(t *testing.T) {
+	defer Svc.reset()
+	defer SetGlobalTenantRegistry(nil)
+
+	SetGlobalTenantRegistry(&stubTenantRegistry{tenants: map[string]Tenant{}})
+
+	origNewSender := newOCIEmailSender
+	defer func() { newOCIEmailSender = origNewSender }()
+	fake := &fakeOCIEmailSender{}
+	newOCIEmailSender = func(_ *ociemailConfig) ociemailSenderAPI { return fake }
+
+	l, _ := log.GetLogger("./test_ociemail_tenant_send.log", "debug")
+	g, err := New(BackendConfig{
+		"save_process":         "HeadersParser|Header|OCIEmail",
+		"primary_mail_host":    "mail.example.com",
+		"ociemail_source_tmpl": "${hdr_from}",
+		"ociemail_to_tmpl":     "${rcpt_to}",
+		"ociemail_fail_hard":   true,
+	}, l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = g.Shutdown() }()
+
+	e := mail.NewEnvelope("127.0.0.1", 1)
+	e.RcptTo = append(e.RcptTo, mail.Address{User: "bob", Host: "rcpt.example"})
+	_, _ = e.Data.WriteString("From: support@domain.example\r\nSubject: Hello\r\n\r\nBody")
+	SetEnvelopeTenantSend(e, &TenantSendConfig{
+		TenantID: "acme",
+		Provider: "oci",
+		OCIEmail: &TenantOCI{Region: "us-phoenix-1", Username: "tenant-user", Password: "tenant-pass"},
+	})
+
+	res := g.Process(e)
+	if res.Code() >= 400 {
+		t.Fatalf("expected success with tenant credentials, got: %v", res)
+	}
+	if fake.lastReq == nil {
+		t.Fatal("expected tenant OCI sender to be called")
+	}
+	if fake.lastReq.Host != "smtp.email.us-phoenix-1.oci.oraclecloud.com" {
+		t.Fatalf("unexpected host: %q", fake.lastReq.Host)
+	}
+}
+
 func TestIsOCIAuthFailure(t *testing.T) {
 	if !isOCIAuthFailure(errors.New("535 Authentication required")) {
 		t.Fatal("expected 535 to be auth failure")

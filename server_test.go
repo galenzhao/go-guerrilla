@@ -27,11 +27,11 @@ type staticPlainAuthenticator struct {
 	pass string
 }
 
-func (a staticPlainAuthenticator) AuthenticatePlain(identity, username, password string, e *mail.Envelope) (bool, error) {
+func (a staticPlainAuthenticator) AuthenticatePlain(identity, username, password string, e *mail.Envelope) (AuthResult, error) {
 	if username == a.user && password == a.pass {
-		return true, nil
+		return AuthResult{OK: true}, nil
 	}
-	return false, nil
+	return AuthResult{OK: false}, nil
 }
 
 func mustFreeTCPAddrAuth(t *testing.T) string {

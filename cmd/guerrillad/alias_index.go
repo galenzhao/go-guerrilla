@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
 
+	"github.com/flashmob/go-guerrilla"
 	"github.com/flashmob/go-guerrilla/backends"
 	"github.com/flashmob/go-guerrilla/log"
 	"github.com/spf13/cobra"
@@ -38,7 +40,7 @@ func runAliasIndex(cmd *cobra.Command, args []string) {
 		mainlog, _ = log.GetLogger(log.OutputStderr.String(), log.DebugLevel.String())
 	}
 
-	backendConfig, err := loadBackendConfig(aliasIndexConfigPath)
+	appConfig, backendConfig, err := loadAppAndBackendConfig(aliasIndexConfigPath)
 	if err != nil {
 		mainlog.WithError(err).Fatal("failed to load config")
 	}
@@ -46,6 +48,20 @@ func runAliasIndex(cmd *cobra.Command, args []string) {
 	indexerCfg, err := backends.AliasIndexerConfigFromBackend(backendConfig)
 	if err != nil {
 		mainlog.WithError(err).Fatal("invalid alias-index config")
+	}
+
+	if appConfig.TenantRegistry.URL != "" {
+		registry, err := guerrilla.NewTenantRegistryFromConfig(appConfig.TenantRegistry)
+		if err != nil {
+			mainlog.WithError(err).Fatal("failed to initialize tenant registry")
+		}
+		indexerCfg.Registry = registry
+		if len(indexerCfg.Accounts) > 0 {
+			mainlog.Warn("tenant_registry is configured; ignoring static alias_index_pop3_accounts")
+			indexerCfg.Accounts = nil
+		}
+	} else if len(indexerCfg.Accounts) == 0 {
+		mainlog.Fatal("either tenant_registry.url or alias_index_pop3_accounts is required")
 	}
 
 	indexer, err := backends.NewAliasIndexer(indexerCfg)
@@ -63,9 +79,20 @@ func runAliasIndex(cmd *cobra.Command, args []string) {
 	}()
 
 	mainlog.Info("alias-index started")
-	if len(indexerCfg.Accounts) > 0 {
-		mailboxes := make([]string, 0, len(indexerCfg.Accounts))
-		for _, account := range indexerCfg.Accounts {
+	accounts := indexerCfg.Accounts
+	if indexerCfg.Registry != nil {
+		if err := indexerCfg.Registry.Refresh(context.Background()); err != nil {
+			mainlog.WithError(err).Warn("initial tenant registry refresh failed")
+		} else {
+			accounts = nil
+			for _, item := range indexerCfg.Registry.POP3Accounts() {
+				accounts = append(accounts, item.Account)
+			}
+		}
+	}
+	if len(accounts) > 0 {
+		mailboxes := make([]string, 0, len(accounts))
+		for _, account := range accounts {
 			mailboxes = append(mailboxes, account.MailboxKey())
 		}
 		mainlog.WithField("mailboxes", mailboxes).Infof("alias-index watching %d POP3 mailbox(es)", len(mailboxes))
@@ -76,19 +103,22 @@ func runAliasIndex(cmd *cobra.Command, args []string) {
 	mainlog.Info("alias-index stopped")
 }
 
-func loadBackendConfig(path string) (backends.BackendConfig, error) {
+func loadAppAndBackendConfig(path string) (guerrilla.AppConfig, backends.BackendConfig, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return guerrilla.AppConfig{}, nil, err
 	}
-	var app struct {
-		BackendConfig backends.BackendConfig `json:"backend_config"`
-	}
+	var app guerrilla.AppConfig
 	if err := json.Unmarshal(data, &app); err != nil {
-		return nil, err
+		return guerrilla.AppConfig{}, nil, err
 	}
 	if app.BackendConfig == nil {
-		return nil, fmt.Errorf("backend_config missing in %s", path)
+		return app, nil, fmt.Errorf("backend_config missing in %s", path)
 	}
-	return app.BackendConfig, nil
+	return app, app.BackendConfig, nil
+}
+
+func loadBackendConfig(path string) (backends.BackendConfig, error) {
+	_, backendConfig, err := loadAppAndBackendConfig(path)
+	return backendConfig, err
 }

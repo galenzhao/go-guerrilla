@@ -77,6 +77,31 @@ func TestAliasStoreUpsertLookupPurge(t *testing.T) {
 	}
 }
 
+func TestAliasStoreTenantID(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenAliasStore(AliasStoreConfig{DBPath: filepath.Join(dir, "alias.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if err := store.UpsertThread(AliasThread{
+		MessageID: "<msg-tenant@example.com>",
+		ReplyAs:   "support@example.com",
+		OrigFrom:  "sender@qq.com",
+		TenantID:  "acme",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.LookupThread("<msg-tenant@example.com>")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.TenantID != "acme" {
+		t.Fatalf("tenant_id not stored: %+v", got)
+	}
+}
+
 func TestAliasStoreUIDLBaseline(t *testing.T) {
 	dir := t.TempDir()
 	store, err := OpenAliasStore(AliasStoreConfig{DBPath: filepath.Join(dir, "alias.db")})

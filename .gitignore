@@ -4,7 +4,7 @@
 # Local configuration (may contain credentials)
 goguerrilla.conf
 goguerrilla.conf.json
-goguerrilla.conf.api
+authmock.conf
 /ses_accessKeys.csv
 certs/
 

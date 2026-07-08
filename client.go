@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/flashmob/go-guerrilla/backends"
 	"github.com/flashmob/go-guerrilla/log"
 	"github.com/flashmob/go-guerrilla/mail"
 	"github.com/flashmob/go-guerrilla/mail/rfc5321"
@@ -42,6 +43,8 @@ type client struct {
 	Authed bool
 	// AuthUser is the authenticated username (AUTH PLAIN authcid).
 	AuthUser string
+	// AuthTenant holds tenant send config returned by the authenticator.
+	AuthTenant *backends.TenantSendConfig
 	// Number of errors encountered during session with this client
 	errors       int
 	state        ClientState
@@ -177,6 +180,7 @@ func (c *client) init(conn net.Conn, clientID uint64, ep *mail.Pool) {
 	c.errors = 0
 	c.Authed = false
 	c.AuthUser = ""
+	c.AuthTenant = nil
 	// borrow an envelope from the envelope pool
 	c.Envelope = ep.Borrow(getRemoteAddr(conn), clientID)
 }

@@ -33,6 +33,8 @@ type AppConfig struct {
 	BackendConfig backends.BackendConfig `json:"backend_config"`
 	// Auth configures SMTP AUTH for relaying.
 	Auth AuthConfig `json:"auth,omitempty"`
+	// TenantRegistry configures dynamic tenant lookup for alias-reply and alias-index.
+	TenantRegistry TenantRegistryConfig `json:"tenant_registry,omitempty"`
 }
 
 // AuthConfig configures SMTP AUTH backends.
@@ -48,6 +50,14 @@ type AuthConfig struct {
 	Timeout string `json:"timeout,omitempty"`
 	// Headers are static headers included in the auth HTTP request.
 	Headers map[string]string `json:"headers,omitempty"`
+}
+
+// TenantRegistryConfig configures the HTTP tenant registry (GET /tenants).
+type TenantRegistryConfig struct {
+	URL          string            `json:"url,omitempty"`
+	PollInterval string            `json:"poll_interval,omitempty"`
+	Timeout      string            `json:"timeout,omitempty"`
+	Headers      map[string]string `json:"headers,omitempty"`
 }
 
 // ServerConfig specifies config options for a single server

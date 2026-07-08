@@ -3,6 +3,7 @@ package backends
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"net/mail"
 	"strings"
@@ -82,6 +83,7 @@ type AliasPOP3Account struct {
 	TLS      bool
 	User     string
 	Password string
+	TenantID string
 }
 
 // MailboxKey returns the stable key for UIDL baseline and cursor storage.
@@ -108,6 +110,7 @@ type AliasIndexerConfig struct {
 	SkipExistingOnStart bool
 	Since               time.Time
 	StoreCfg            AliasStoreConfig
+	Registry            TenantRegistry
 }
 
 // AliasIndexer polls one or more POP3 mailboxes and writes alias thread mappings.
@@ -118,8 +121,11 @@ type AliasIndexer struct {
 
 // NewAliasIndexer creates an indexer using the given config.
 func NewAliasIndexer(cfg AliasIndexerConfig) (*AliasIndexer, error) {
-	if len(cfg.Accounts) == 0 {
-		return nil, fmt.Errorf("at least one alias_index POP3 account is required")
+	if cfg.Registry != nil {
+		// Registry mode: ignore static Accounts; POP3 list comes only from GET /tenants.
+		cfg.Accounts = nil
+	} else if len(cfg.Accounts) == 0 {
+		return nil, fmt.Errorf("at least one alias_index POP3 account or tenant_registry is required")
 	}
 	for i := range cfg.Accounts {
 		if cfg.Accounts[i].Port <= 0 {
@@ -167,6 +173,21 @@ func (i *AliasIndexer) Run(done <-chan struct{}) error {
 	pollTicker := time.NewTicker(i.cfg.PollInterval)
 	defer pollTicker.Stop()
 
+	var registryTicker *time.Ticker
+	var registryC <-chan time.Time
+	if i.cfg.Registry != nil {
+		if interval := i.cfg.Registry.PollInterval(); interval > 0 {
+			registryTicker = time.NewTicker(interval)
+			defer registryTicker.Stop()
+			registryC = registryTicker.C
+			if err := i.cfg.Registry.Refresh(context.Background()); err != nil {
+				Log().WithError(err).Warn("alias-index tenant registry refresh failed on start")
+			} else {
+				i.refreshAccountsFromRegistry()
+			}
+		}
+	}
+
 	i.pollAll()
 	for {
 		select {
@@ -176,15 +197,51 @@ func (i *AliasIndexer) Run(done <-chan struct{}) error {
 			if err := i.store.PurgeExpired(); err != nil {
 				Log().WithError(err).Warn("alias-index purge failed")
 			}
+		case <-registryC:
+			if err := i.cfg.Registry.Refresh(context.Background()); err != nil {
+				Log().WithError(err).Warn("alias-index tenant registry refresh failed")
+			} else {
+				i.refreshAccountsFromRegistry()
+			}
 		case <-pollTicker.C:
 			i.pollAll()
 		}
 	}
 }
 
+func (i *AliasIndexer) refreshAccountsFromRegistry() {
+	if i.cfg.Registry == nil {
+		return
+	}
+	tagged := i.cfg.Registry.POP3Accounts()
+	accounts := make([]AliasPOP3Account, 0, len(tagged))
+	for _, item := range tagged {
+		accounts = append(accounts, item.Account)
+	}
+	i.cfg.Accounts = accounts
+	Log().WithField("mailboxes", len(accounts)).Info("alias-index refreshed POP3 accounts from tenant registry")
+}
+
+func (i *AliasIndexer) currentAccounts() []AliasPOP3Account {
+	if i.cfg.Registry != nil {
+		// Registry mode never falls back to static local POP3 accounts.
+		tagged := i.cfg.Registry.POP3Accounts()
+		accounts := make([]AliasPOP3Account, 0, len(tagged))
+		for _, item := range tagged {
+			accounts = append(accounts, item.Account)
+		}
+		return accounts
+	}
+	return i.cfg.Accounts
+}
+
 func (i *AliasIndexer) pollAll() {
+	accounts := i.currentAccounts()
+	if len(accounts) == 0 {
+		return
+	}
 	var wg sync.WaitGroup
-	for _, account := range i.cfg.Accounts {
+	for _, account := range accounts {
 		account := account
 		wg.Add(1)
 		go func() {
@@ -295,6 +352,7 @@ func (i *AliasIndexer) pollMailbox(account AliasPOP3Account) error {
 			MessageID: messageID,
 			ReplyAs:   replyAs,
 			OrigFrom:  origFrom,
+			TenantID:  account.TenantID,
 			CreatedAt: time.Now().UTC(),
 		}); err != nil {
 			return err
@@ -360,9 +418,13 @@ func AliasIndexerConfigFromBackend(backendConfig BackendConfig) (AliasIndexerCon
 
 	accounts, err := parseAliasPOP3Accounts(backendConfig)
 	if err != nil {
-		return cfg, err
+		// Static POP3 accounts are optional when tenant_registry will supply them.
+		if !strings.Contains(err.Error(), "is required") {
+			return cfg, err
+		}
+	} else {
+		cfg.Accounts = accounts
 	}
-	cfg.Accounts = accounts
 	cfg.StoreCfg.DBPath = cfg.DBPath
 	return cfg, nil
 }

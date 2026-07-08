@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"github.com/flashmob/go-guerrilla/backends"
 	"github.com/flashmob/go-guerrilla/mail"
 	"io"
 	"net/http"
@@ -17,7 +18,13 @@ import (
 // For this implementation, only AUTH PLAIN is supported.
 // identity is the optional "authorization identity" (may be empty).
 type Authenticator interface {
-	AuthenticatePlain(identity, username, password string, e *mail.Envelope) (bool, error)
+	AuthenticatePlain(identity, username, password string, e *mail.Envelope) (AuthResult, error)
+}
+
+// AuthResult is the outcome of SMTP AUTH credential validation.
+type AuthResult struct {
+	OK     bool
+	Tenant *backends.TenantSendConfig
 }
 
 type authenticatorHolder struct {
@@ -84,7 +91,7 @@ func NewHTTPAuthenticator(cfg HTTPAuthenticatorConfig) Authenticator {
 	}
 }
 
-func (h *httpAuthenticator) AuthenticatePlain(identity, username, password string, e *mail.Envelope) (bool, error) {
+func (h *httpAuthenticator) AuthenticatePlain(identity, username, password string, e *mail.Envelope) (AuthResult, error) {
 	body, err := json.Marshal(httpAuthRequest{
 		Identity: identity,
 		Username: username,
@@ -94,11 +101,11 @@ func (h *httpAuthenticator) AuthenticatePlain(identity, username, password strin
 		TLS:      e.TLS,
 	})
 	if err != nil {
-		return false, err
+		return AuthResult{}, err
 	}
 	req, err := http.NewRequest(http.MethodPost, h.url, bytes.NewReader(body))
 	if err != nil {
-		return false, err
+		return AuthResult{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	for k, v := range h.headers {
@@ -106,21 +113,28 @@ func (h *httpAuthenticator) AuthenticatePlain(identity, username, password strin
 	}
 	resp, err := h.client.Do(req)
 	if err != nil {
-		return false, err
+		return AuthResult{}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return false, err
+		return AuthResult{}, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return false, nil
+		return AuthResult{OK: false}, nil
 	}
 	var out httpAuthResponse
 	if err := json.Unmarshal(respBody, &out); err != nil {
-		return false, err
+		return AuthResult{}, err
 	}
-	return out.OK, nil
+	if !out.OK {
+		return AuthResult{OK: false}, nil
+	}
+	tenant, err := backends.ParseTenantSendConfigFromAuth(respBody)
+	if err != nil {
+		return AuthResult{}, err
+	}
+	return AuthResult{OK: true, Tenant: tenant}, nil
 }
 
 func decodeBase64Lenient(in string) ([]byte, error) {
@@ -154,4 +168,3 @@ func parseAuthPlainIR(b64 string) (identity, username, password string, err erro
 	}
 	return identity, username, password, nil
 }
-

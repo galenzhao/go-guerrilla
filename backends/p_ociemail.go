@@ -51,8 +51,8 @@ type ociemailConfig struct {
 	Host                  string `json:"ociemail_host,omitempty"`
 	Region                string `json:"ociemail_region,omitempty"`
 	Port                  int    `json:"ociemail_port,omitempty"`
-	Username              string `json:"ociemail_username"`
-	Password              string `json:"ociemail_password"`
+	Username              string `json:"ociemail_username,omitempty"`
+	Password              string `json:"ociemail_password,omitempty"`
 	Timeout               string `json:"ociemail_timeout,omitempty"`
 	FailHard              bool   `json:"ociemail_fail_hard,omitempty"`
 	SourceTmpl            string `json:"ociemail_source_tmpl"`
@@ -83,8 +83,35 @@ var newOCIEmailSender = func(cfg *ociemailConfig) ociemailSenderAPI {
 
 func OCIEmail() Decorator {
 	var sender *ociemailSender
+	tenantOnly := false
 
 	Svc.AddInitializer(InitializeWith(func(backendConfig BackendConfig) error {
+		configType := BaseConfig(&ociemailConfig{})
+		bcfg, err := Svc.ExtractConfig(backendConfig, configType)
+		if err != nil {
+			return err
+		}
+		cfg := bcfg.(*ociemailConfig)
+
+		applyOCIEmailConfigDefaults(cfg)
+
+		// With tenant_registry, local OCI credentials are ignored; send only via tenant config.
+		if GlobalTenantRegistry() != nil {
+			if strings.TrimSpace(cfg.SourceTmpl) == "" {
+				return fmt.Errorf("ociemail_source_tmpl is required")
+			}
+			if strings.TrimSpace(cfg.ToTmpl) == "" {
+				return fmt.Errorf("ociemail_to_tmpl is required")
+			}
+			if err := validateOCIEmailTimeout(cfg); err != nil {
+				return err
+			}
+			tenantOnly = true
+			sender = &ociemailSender{cfg: cfg}
+			Log().Info("OCI Email using tenant_registry credentials only (local ociemail_* credentials ignored)")
+			return nil
+		}
+
 		username, _ := backendConfig["ociemail_username"].(string)
 		region, _ := backendConfig["ociemail_region"].(string)
 		host, _ := backendConfig["ociemail_host"].(string)
@@ -92,14 +119,6 @@ func OCIEmail() Decorator {
 			// OCI Email not configured; skip when using another outbound processor (eg SES).
 			return nil
 		}
-
-		configType := BaseConfig(&ociemailConfig{})
-		bcfg, err := Svc.ExtractConfig(backendConfig, configType)
-		if err != nil {
-			return err
-		}
-
-		cfg := bcfg.(*ociemailConfig)
 		if _, err := resolveOCIEmailHost(cfg); err != nil {
 			return err
 		}
@@ -115,18 +134,8 @@ func OCIEmail() Decorator {
 		if strings.TrimSpace(cfg.ToTmpl) == "" {
 			return fmt.Errorf("ociemail_to_tmpl is required")
 		}
-
-		if strings.TrimSpace(cfg.Timeout) != "" {
-			if _, derr := time.ParseDuration(strings.TrimSpace(cfg.Timeout)); derr != nil {
-				return fmt.Errorf("invalid ociemail_timeout: %w", derr)
-			}
-		}
-
-		if cfg.Port <= 0 {
-			cfg.Port = defaultOCIEmailPort
-		}
-		if cfg.MaxBytes <= 0 {
-			cfg.MaxBytes = defaultOCIEmailMaxBytes
+		if err := validateOCIEmailTimeout(cfg); err != nil {
+			return err
 		}
 
 		sender = &ociemailSender{
@@ -141,7 +150,7 @@ func OCIEmail() Decorator {
 			if task != TaskSaveMail {
 				return p.Process(e, task)
 			}
-			if sender == nil || sender.client == nil || sender.cfg == nil {
+			if sender == nil || sender.cfg == nil || (!tenantOnly && sender.client == nil) {
 				err := fmt.Errorf("ociemail processor not initialized")
 				if sender != nil && sender.cfg != nil && !sender.cfg.FailHard {
 					Log().WithError(err).Warn("OCI Email not initialized; skipping send")
@@ -151,60 +160,85 @@ func OCIEmail() Decorator {
 			}
 
 			vars := makeSESVars(e)
-			source := strings.TrimSpace(applySESTemplate(sender.cfg.SourceTmpl, vars))
+			activeCfg := sender.cfg
+			tenant := GetEnvelopeTenantSend(e)
+			if tenantOnly && tenant == nil {
+				err := fmt.Errorf("tenant_registry is configured; tenant send credentials are required")
+				if activeCfg.FailHard {
+					return NewResult(response.Canned.FailBackendTransaction, response.SP, err), err
+				}
+				Log().WithError(err).Warn("OCI Email missing tenant credentials; skipping send")
+				return p.Process(e, task)
+			}
+			if tenant != nil {
+				if tenant.Provider != "oci" {
+					err := fmt.Errorf("tenant %s provider %q does not match OCIEmail processor", tenant.TenantID, tenant.Provider)
+					if activeCfg.FailHard {
+						return NewResult(response.Canned.FailBackendTransaction, response.SP, err), err
+					}
+					Log().WithError(err).Warn("OCI Email tenant provider mismatch; skipping send")
+					return p.Process(e, task)
+				}
+			}
+
+			source := strings.TrimSpace(applySESTemplate(activeCfg.SourceTmpl, vars))
 			source = normalizeEmailAddress(source)
-			dests := splitAddresses(applySESTemplate(sender.cfg.ToTmpl, vars))
+			dests := splitAddresses(applySESTemplate(activeCfg.ToTmpl, vars))
 
 			if source == "" || len(dests) == 0 {
 				err := fmt.Errorf("ociemail template produced empty source or destinations")
-				if sender.cfg.FailHard {
+				if activeCfg.FailHard {
 					return NewResult(response.Canned.FailBackendTransaction, response.SP, err), err
 				}
 				Log().WithError(err).Warn("OCI Email template invalid; skipping send")
 				return p.Process(e, task)
 			}
 
-			raw, rerr := buildRawMessage(e, sender.cfg.IncludeDeliveryHeader)
+			raw, rerr := buildRawMessage(e, activeCfg.IncludeDeliveryHeader)
 			if rerr != nil {
-				if sender.cfg.FailHard {
+				if activeCfg.FailHard {
 					return NewResult(response.Canned.FailBackendTransaction, response.SP, rerr), rerr
 				}
 				Log().WithError(rerr).Warn("OCI Email raw message build failed; skipping send")
 				return p.Process(e, task)
 			}
-			if len(raw) > sender.cfg.MaxBytes {
-				err := fmt.Errorf("ociemail raw message too large: %d bytes > %d", len(raw), sender.cfg.MaxBytes)
-				if sender.cfg.FailHard {
+			if len(raw) > activeCfg.MaxBytes {
+				err := fmt.Errorf("ociemail raw message too large: %d bytes > %d", len(raw), activeCfg.MaxBytes)
+				if activeCfg.FailHard {
 					return NewResult(response.Canned.FailBackendTransaction, response.SP, err), err
 				}
 				Log().WithError(err).Warn("OCI Email message too large; skipping send")
 				return p.Process(e, task)
 			}
 
-			host, herr := resolveOCIEmailHost(sender.cfg)
-			if herr != nil {
-				if sender.cfg.FailHard {
-					return NewResult(response.Canned.FailBackendTransaction, response.SP, herr), herr
-				}
-				Log().WithError(herr).Warn("OCI Email host resolution failed; skipping send")
-				return p.Process(e, task)
-			}
-
 			ctx := context.Background()
-			if d := ociemailTimeout(sender.cfg); d > 0 {
+			if d := ociemailTimeout(activeCfg); d > 0 {
 				var cancel context.CancelFunc
 				ctx, cancel = context.WithTimeout(ctx, d)
 				defer cancel()
 			}
 
-			err := sender.client.Send(ctx, sender.cfg, &ociemailSendRequest{
-				Host: host,
-				From: source,
-				To:   dests,
-				Raw:  raw,
-			})
+			var err error
+			if tenant != nil {
+				err = SendViaTenantOCI(ctx, tenant, activeCfg, source, dests, raw)
+			} else {
+				host, herr := resolveOCIEmailHost(activeCfg)
+				if herr != nil {
+					if activeCfg.FailHard {
+						return NewResult(response.Canned.FailBackendTransaction, response.SP, herr), herr
+					}
+					Log().WithError(herr).Warn("OCI Email host resolution failed; skipping send")
+					return p.Process(e, task)
+				}
+				err = sender.client.Send(ctx, activeCfg, &ociemailSendRequest{
+					Host: host,
+					From: source,
+					To:   dests,
+					Raw:  raw,
+				})
+			}
 			if err != nil {
-				if sender.cfg.FailHard {
+				if activeCfg.FailHard {
 					return NewResult(response.Canned.FailBackendTransaction, response.SP, err), err
 				}
 				Log().WithError(err).Warn("OCI Email send failed; continuing")
@@ -213,6 +247,25 @@ func OCIEmail() Decorator {
 			return p.Process(e, task)
 		})
 	}
+}
+
+func applyOCIEmailConfigDefaults(cfg *ociemailConfig) {
+	if cfg.Port <= 0 {
+		cfg.Port = defaultOCIEmailPort
+	}
+	if cfg.MaxBytes <= 0 {
+		cfg.MaxBytes = defaultOCIEmailMaxBytes
+	}
+}
+
+func validateOCIEmailTimeout(cfg *ociemailConfig) error {
+	if strings.TrimSpace(cfg.Timeout) == "" {
+		return nil
+	}
+	if _, err := time.ParseDuration(strings.TrimSpace(cfg.Timeout)); err != nil {
+		return fmt.Errorf("invalid ociemail_timeout: %w", err)
+	}
+	return nil
 }
 
 func resolveOCIEmailHost(cfg *ociemailConfig) (string, error) {

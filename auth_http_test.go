@@ -24,12 +24,55 @@ func TestHTTPAuthenticatorAuthenticatePlain(t *testing.T) {
 		URL:     s.URL,
 		Timeout: 2 * time.Second,
 	})
-	ok, err := a.AuthenticatePlain("", "u", "p", &mail.Envelope{})
+	result, err := a.AuthenticatePlain("", "u", "p", &mail.Envelope{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !ok {
+	if !result.OK {
 		t.Fatal("expected authentication success")
+	}
+}
+
+func TestHTTPAuthenticatorTenantOCI(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"ok": true,
+			"tenant_id": "acme",
+			"provider": "oci",
+			"ociemail": {
+				"region": "us-phoenix-1",
+				"username": "user",
+				"password": "pass"
+			}
+		}`))
+	}))
+	defer s.Close()
+
+	a := NewHTTPAuthenticator(HTTPAuthenticatorConfig{URL: s.URL, Timeout: 2 * time.Second})
+	result, err := a.AuthenticatePlain("", "u", "p", &mail.Envelope{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.OK || result.Tenant == nil {
+		t.Fatal("expected tenant auth success")
+	}
+	if result.Tenant.TenantID != "acme" || result.Tenant.Provider != "oci" {
+		t.Fatalf("unexpected tenant: %+v", result.Tenant)
+	}
+}
+
+func TestHTTPAuthenticatorInvalidTenant(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"tenant_id":"acme","provider":"bad"}`))
+	}))
+	defer s.Close()
+
+	a := NewHTTPAuthenticator(HTTPAuthenticatorConfig{URL: s.URL, Timeout: 2 * time.Second})
+	_, err := a.AuthenticatePlain("", "u", "p", &mail.Envelope{})
+	if err == nil {
+		t.Fatal("expected invalid tenant parse error")
 	}
 }
 
@@ -44,11 +87,11 @@ func TestHTTPAuthenticatorInvalidCredentials(t *testing.T) {
 		URL:     s.URL,
 		Timeout: 2 * time.Second,
 	})
-	ok, err := a.AuthenticatePlain("", "u", "wrong", &mail.Envelope{})
+	result, err := a.AuthenticatePlain("", "u", "wrong", &mail.Envelope{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ok {
+	if result.OK {
 		t.Fatal("expected authentication failure")
 	}
 }
@@ -63,11 +106,11 @@ func TestHTTPAuthenticatorTemporaryFailure(t *testing.T) {
 		URL:     s.URL,
 		Timeout: 2 * time.Second,
 	})
-	ok, err := a.AuthenticatePlain("", "u", "p", &mail.Envelope{})
+	result, err := a.AuthenticatePlain("", "u", "p", &mail.Envelope{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ok {
+	if result.OK {
 		t.Fatal("expected non-2xx to fail authentication")
 	}
 }
@@ -92,4 +135,3 @@ func TestNewHTTPAuthenticatorFromConfig(t *testing.T) {
 		t.Fatal(errors.New("expected authenticator"))
 	}
 }
-

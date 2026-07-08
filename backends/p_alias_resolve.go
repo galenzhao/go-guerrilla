@@ -139,6 +139,19 @@ func AliasResolve() Decorator {
 			}
 			e.Values["alias_reply_as"] = thread.ReplyAs
 
+			if reg := GlobalTenantRegistry(); reg != nil {
+				if strings.TrimSpace(thread.TenantID) == "" {
+					err := fmt.Errorf("alias thread missing tenant_id while tenant_registry is configured")
+					return aliasResolveFail(cfg.FailHard, e, messageIDs, matchedID, err, p, task)
+				}
+				tenant, ok := reg.Get(thread.TenantID)
+				if !ok {
+					err := fmt.Errorf("tenant %q not found in tenant_registry", thread.TenantID)
+					return aliasResolveFail(cfg.FailHard, e, messageIDs, matchedID, err, p, task)
+				}
+				SetEnvelopeTenantSend(e, TenantSendFromTenant(tenant))
+			}
+
 			if len(e.RcptTo) > 0 {
 				rcpt := strings.ToLower(e.RcptTo[0].String())
 				if rcpt != "" && thread.OrigFrom != "" && rcpt != thread.OrigFrom {

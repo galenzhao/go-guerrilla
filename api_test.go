@@ -11,6 +11,7 @@ import (
 	"io/ioutil"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -191,14 +192,15 @@ func TestSMTPLoadFile(t *testing.T) {
 }
 
 	`
-	err := ioutil.WriteFile("goguerrilla.conf.api", []byte(json), 0644)
+	confPath := filepath.Join(t.TempDir(), "goguerrilla.conf")
+	err := ioutil.WriteFile(confPath, []byte(json), 0644)
 	if err != nil {
-		t.Error("could not write guerrilla.conf.api", err)
+		t.Error("could not write test config", err)
 		return
 	}
 
 	d := Daemon{}
-	_, err = d.LoadConfig("goguerrilla.conf.api")
+	_, err = d.LoadConfig(confPath)
 	if err != nil {
 		t.Error("ReadConfig error", err)
 		return
@@ -218,13 +220,13 @@ func TestSMTPLoadFile(t *testing.T) {
 			t.Error("d.Config.LogFile != tests/go-guerrilla.pid")
 		}
 
-		err := ioutil.WriteFile("goguerrilla.conf.api", []byte(json2), 0644)
+		err := ioutil.WriteFile(confPath, []byte(json2), 0644)
 		if err != nil {
-			t.Error("could not write guerrilla.conf.api", err)
+			t.Error("could not write test config", err)
 			return
 		}
 
-		if err = d.ReloadConfigFile("goguerrilla.conf.api"); err != nil {
+		if err = d.ReloadConfigFile(confPath); err != nil {
 			t.Error(err)
 		}
 

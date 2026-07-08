@@ -1,0 +1,34 @@
+{
+    "listen": "127.0.0.1:8080",
+    "required_headers": {
+        "X-Auth-Token": "local-dev"
+    },
+    "users": [
+        {
+            "username": "relay@example.com",
+            "password": "change-me-smtp-password",
+            "tenant_id": "example"
+        }
+    ],
+    "tenants": [
+        {
+            "tenant_id": "example",
+            "provider": "oci",
+            "ociemail": {
+                "region": "us-phoenix-1",
+                "port": 587,
+                "username": "ocid1.user.oc1..aaaa...",
+                "password": "change-me-oci-password"
+            },
+            "pop3_accounts": [
+                {
+                    "host": "pop.exmail.qq.com",
+                    "port": 995,
+                    "tls": true,
+                    "user": "catchall@example.com",
+                    "password": "change-me-pop3-password"
+                }
+            ]
+        }
+    ]
+}

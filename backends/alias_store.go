@@ -44,6 +44,7 @@ type AliasThread struct {
 	MessageID string
 	ReplyAs   string
 	OrigFrom  string
+	TenantID  string
 	CreatedAt time.Time
 }
 
@@ -97,7 +98,29 @@ func (s *AliasStore) migrate() error {
 			return fmt.Errorf("alias store migrate: %w", err)
 		}
 	}
-	return s.migrateUIDLTable()
+	if err := s.migrateUIDLTable(); err != nil {
+		return err
+	}
+	return s.migrateTenantIDColumn()
+}
+
+func (s *AliasStore) migrateTenantIDColumn() error {
+	var hasTenantID int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_info('alias_threads') WHERE name = 'tenant_id'`,
+	).Scan(&hasTenantID)
+	if err != nil {
+		return err
+	}
+	if hasTenantID > 0 {
+		return nil
+	}
+	_, err = s.db.Exec(`ALTER TABLE alias_threads ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''`)
+	if err != nil {
+		return fmt.Errorf("alias store migrate tenant_id: %w", err)
+	}
+	_, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_alias_threads_tenant ON alias_threads(tenant_id)`)
+	return err
 }
 
 func (s *AliasStore) migrateUIDLTable() error {
@@ -158,14 +181,16 @@ func (s *AliasStore) UpsertThread(thread AliasThread) error {
 	if createdAt.IsZero() {
 		createdAt = time.Now().UTC()
 	}
+	tenantID := strings.TrimSpace(thread.TenantID)
 	_, err := s.db.Exec(
-		`INSERT INTO alias_threads (message_id, reply_as, orig_from, created_at)
-		 VALUES (?, ?, ?, ?)
+		`INSERT INTO alias_threads (message_id, reply_as, orig_from, tenant_id, created_at)
+		 VALUES (?, ?, ?, ?, ?)
 		 ON CONFLICT(message_id) DO UPDATE SET
 		   reply_as = excluded.reply_as,
 		   orig_from = excluded.orig_from,
+		   tenant_id = excluded.tenant_id,
 		   created_at = excluded.created_at`,
-		messageID, replyAs, origFrom, createdAt.Unix(),
+		messageID, replyAs, origFrom, tenantID, createdAt.Unix(),
 	)
 	return err
 }
@@ -180,14 +205,14 @@ func (s *AliasStore) LookupThread(messageID string) (*AliasThread, error) {
 		return nil, nil
 	}
 	row := s.db.QueryRow(
-		`SELECT message_id, reply_as, orig_from, created_at FROM alias_threads WHERE message_id = ?`,
+		`SELECT message_id, reply_as, orig_from, tenant_id, created_at FROM alias_threads WHERE message_id = ?`,
 		messageID,
 	)
 	var (
-		id, replyAs, origFrom string
-		createdAtUnix         int64
+		id, replyAs, origFrom, tenantID string
+		createdAtUnix                   int64
 	)
-	if err := row.Scan(&id, &replyAs, &origFrom, &createdAtUnix); err != nil {
+	if err := row.Scan(&id, &replyAs, &origFrom, &tenantID, &createdAtUnix); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
@@ -197,6 +222,7 @@ func (s *AliasStore) LookupThread(messageID string) (*AliasThread, error) {
 		MessageID: id,
 		ReplyAs:   replyAs,
 		OrigFrom:  origFrom,
+		TenantID:  tenantID,
 		CreatedAt: time.Unix(createdAtUnix, 0).UTC(),
 	}, nil
 }
