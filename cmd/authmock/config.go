@@ -27,6 +27,7 @@ type mockTenant struct {
 	SES          *mockSES        `json:"ses,omitempty"`
 	OCIEmail     *mockOCIEmail   `json:"ociemail,omitempty"`
 	POP3Accounts []mockPOP3      `json:"pop3_accounts,omitempty"`
+	IMAPAccounts []mockIMAP      `json:"imap_accounts,omitempty"`
 }
 
 type mockSES struct {
@@ -44,6 +45,14 @@ type mockOCIEmail struct {
 }
 
 type mockPOP3 struct {
+	Host     string `json:"host"`
+	Port     int    `json:"port,omitempty"`
+	TLS      bool   `json:"tls,omitempty"`
+	User     string `json:"user"`
+	Password string `json:"password"`
+}
+
+type mockIMAP struct {
 	Host     string `json:"host"`
 	Port     int    `json:"port,omitempty"`
 	TLS      bool   `json:"tls,omitempty"`

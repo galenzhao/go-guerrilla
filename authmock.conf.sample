@@ -28,6 +28,15 @@
                     "user": "catchall@example.com",
                     "password": "change-me-pop3-password"
                 }
+            ],
+            "imap_accounts": [
+                {
+                    "host": "imap.exmail.qq.com",
+                    "port": 993,
+                    "tls": true,
+                    "user": "catchall@example.com",
+                    "password": "change-me-imap-password"
+                }
             ]
         }
     ]

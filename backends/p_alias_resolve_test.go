@@ -124,6 +124,7 @@ func (s *stubTenantRegistry) Get(tenantID string) (*Tenant, bool) {
 	return &copy, true
 }
 func (s *stubTenantRegistry) POP3Accounts() []TaggedPOP3Account { return nil }
+func (s *stubTenantRegistry) IMAPAccounts() []TaggedIMAPAccount { return nil }
 func (s *stubTenantRegistry) PollInterval() time.Duration       { return time.Minute }
 
 func TestAliasResolveInjectReplyAs(t *testing.T) {

@@ -38,7 +38,35 @@ CREATE TABLE IF NOT EXISTS alias_index_state (
   value TEXT NOT NULL
 );
 `
+	aliasIndexIMAPCursorSchema = `
+CREATE TABLE IF NOT EXISTS alias_index_imap_cursor (
+  mailbox       TEXT NOT NULL,
+  folder        TEXT NOT NULL,
+  uidvalidity   INTEGER NOT NULL,
+  last_uid      INTEGER NOT NULL,
+  baseline_done INTEGER NOT NULL,
+  PRIMARY KEY (mailbox, folder)
+);
+`
+	aliasIndexSeenMessageSchema = `
+CREATE TABLE IF NOT EXISTS alias_index_seen_message (
+  mailbox    TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  seen_at    INTEGER NOT NULL,
+  PRIMARY KEY (mailbox, message_id)
+);
+`
+	aliasIndexSeenMessageBatchSize = 2000
 )
+
+// IMAPCursor tracks per-folder UID progress for IMAP indexing.
+type IMAPCursor struct {
+	Mailbox       string
+	Folder        string
+	UIDValidity   uint32
+	LastUID       uint32
+	BaselineDone  bool
+}
 
 // AliasThread is a single Message-ID to reply-as mapping.
 type AliasThread struct {
@@ -94,7 +122,13 @@ func OpenAliasStore(cfg AliasStoreConfig) (*AliasStore, error) {
 }
 
 func (s *AliasStore) migrate() error {
-	for _, stmt := range []string{aliasThreadsSchema, aliasIndexUIDLSchema, aliasIndexStateSchema} {
+	for _, stmt := range []string{
+		aliasThreadsSchema,
+		aliasIndexUIDLSchema,
+		aliasIndexStateSchema,
+		aliasIndexIMAPCursorSchema,
+		aliasIndexSeenMessageSchema,
+	} {
 		if _, err := s.db.Exec(stmt); err != nil {
 			return fmt.Errorf("alias store migrate: %w", err)
 		}
@@ -405,6 +439,152 @@ func (s *AliasStore) KnownUIDLsForMailbox(mailbox string) (map[string]struct{}, 
 		known[uidl] = struct{}{}
 	}
 	return known, rows.Err()
+}
+
+// GetIMAPCursor returns the stored cursor for a mailbox folder.
+func (s *AliasStore) GetIMAPCursor(mailbox, folder string) (*IMAPCursor, error) {
+	if s == nil || s.db == nil {
+		return nil, fmt.Errorf("alias store not open")
+	}
+	mailbox = strings.TrimSpace(mailbox)
+	folder = strings.TrimSpace(folder)
+	row := s.db.QueryRow(
+		`SELECT mailbox, folder, uidvalidity, last_uid, baseline_done FROM alias_index_imap_cursor WHERE mailbox = ? AND folder = ?`,
+		mailbox, folder,
+	)
+	var cursor IMAPCursor
+	var baselineDone int
+	if err := row.Scan(&cursor.Mailbox, &cursor.Folder, &cursor.UIDValidity, &cursor.LastUID, &baselineDone); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	cursor.BaselineDone = baselineDone != 0
+	return &cursor, nil
+}
+
+// SetIMAPCursor stores per-folder UID progress for IMAP indexing.
+func (s *AliasStore) SetIMAPCursor(cursor IMAPCursor) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("alias store not open")
+	}
+	baselineDone := 0
+	if cursor.BaselineDone {
+		baselineDone = 1
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO alias_index_imap_cursor (mailbox, folder, uidvalidity, last_uid, baseline_done)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(mailbox, folder) DO UPDATE SET
+		   uidvalidity = excluded.uidvalidity,
+		   last_uid = excluded.last_uid,
+		   baseline_done = excluded.baseline_done`,
+		strings.TrimSpace(cursor.Mailbox),
+		strings.TrimSpace(cursor.Folder),
+		cursor.UIDValidity,
+		cursor.LastUID,
+		baselineDone,
+	)
+	return err
+}
+
+// DeleteIMAPCursor removes cursor state for a mailbox folder.
+func (s *AliasStore) DeleteIMAPCursor(mailbox, folder string) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("alias store not open")
+	}
+	_, err := s.db.Exec(
+		`DELETE FROM alias_index_imap_cursor WHERE mailbox = ? AND folder = ?`,
+		strings.TrimSpace(mailbox), strings.TrimSpace(folder),
+	)
+	return err
+}
+
+// IsSeenMessage reports whether a Message-ID was already processed for a mailbox.
+func (s *AliasStore) IsSeenMessage(mailbox, messageID string) (bool, error) {
+	if s == nil || s.db == nil {
+		return false, fmt.Errorf("alias store not open")
+	}
+	messageID = normalizeMessageID(messageID)
+	if messageID == "" {
+		return false, nil
+	}
+	var exists int
+	err := s.db.QueryRow(
+		`SELECT 1 FROM alias_index_seen_message WHERE mailbox = ? AND message_id = ? LIMIT 1`,
+		strings.TrimSpace(mailbox), messageID,
+	).Scan(&exists)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// MarkSeenMessage records a Message-ID as seen without creating a thread mapping.
+func (s *AliasStore) MarkSeenMessage(mailbox, messageID string) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("alias store not open")
+	}
+	messageID = normalizeMessageID(messageID)
+	if messageID == "" {
+		return nil
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO alias_index_seen_message (mailbox, message_id, seen_at) VALUES (?, ?, ?)
+		 ON CONFLICT(mailbox, message_id) DO NOTHING`,
+		strings.TrimSpace(mailbox), messageID, time.Now().UTC().Unix(),
+	)
+	return err
+}
+
+// MarkSeenMessages records many Message-IDs in batched transactions.
+func (s *AliasStore) MarkSeenMessages(mailbox string, messageIDs []string) error {
+	if len(messageIDs) == 0 {
+		return nil
+	}
+	mailbox = strings.TrimSpace(mailbox)
+	for start := 0; start < len(messageIDs); start += aliasIndexSeenMessageBatchSize {
+		end := start + aliasIndexSeenMessageBatchSize
+		if end > len(messageIDs) {
+			end = len(messageIDs)
+		}
+		if err := s.markSeenMessagesBatch(mailbox, messageIDs[start:end]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *AliasStore) markSeenMessagesBatch(mailbox string, messageIDs []string) error {
+	if len(messageIDs) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	stmt, err := tx.Prepare(`INSERT INTO alias_index_seen_message (mailbox, message_id, seen_at) VALUES (?, ?, ?) ON CONFLICT(mailbox, message_id) DO NOTHING`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	defer stmt.Close()
+	now := time.Now().UTC().Unix()
+	for _, raw := range messageIDs {
+		messageID := normalizeMessageID(raw)
+		if messageID == "" {
+			continue
+		}
+		if _, err := stmt.Exec(mailbox, messageID, now); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // ParseAliasDuration parses config durations like "180d" or "1h".

@@ -104,7 +104,7 @@ This fork extends go-guerrilla for a **send-only relay** workflow:
 Two processes are required:
 
 ```bash
-# Terminal 1: index new mail from the catch-all POP3 mailbox
+# Terminal 1: index new mail from catch-all mailboxes (POP3 poll and/or IMAP IDLE)
 ./guerrillad alias-index -c goguerrilla.conf
 
 # Terminal 2: SMTP relay for the mail client
@@ -115,14 +115,15 @@ Copy `goguerrilla.conf.sample` to `goguerrilla.conf` and configure:
 
 | Area | Key settings |
 |------|----------------|
-| Alias index | `alias_index_pop3_accounts` (array), `alias_db_path`, `alias_index_ttl` (default `180d`) |
+| Alias index | `alias_index_pop3_accounts` or tenant `pop3_accounts`; `alias_index_imap_*` or tenant `imap_accounts`; `alias_db_path`, `alias_index_ttl` (default `180d`) |
 | Reply lookup | `AliasResolve` in `save_process`, `alias_fail_hard: true` |
 | Outbound send | `OCIEmail` or `SES` in `save_process`; `ociemail_source_tmpl: "${hdr_x_guerrilla_reply_as}"` |
-| Mail client | SMTP → `127.0.0.1:2525`; POP3 stays on your provider |
+| Mail client | SMTP → `127.0.0.1:2525`; POP3/IMAP stays on your provider |
 
 **How alias reply works**
 
-- `alias-index` polls POP3, records only **new** messages (UIDL baseline per mailbox; no full mailbox backfill).
+- `alias-index` polls POP3 and/or watches IMAP folders (IDLE + resync), recording only **new** messages (baseline per mailbox/folder; no full mailbox backfill).
+- IMAP mode watches **all folders** by default (useful when provider rules move mail out of INBOX). Message-ID dedup prevents double-indexing across folders.
 - Each indexed message stores `Message-ID → reply_as` (from `To` / `Delivered-To` / `X-Original-To`) in SQLite (`alias.db`).
 - On reply, `AliasResolve` looks up `In-Reply-To` / `References` and injects `X-Guerrilla-Reply-As`.
 - `RewriteFrom` and `OCIEmail`/`SES` use `${hdr_x_guerrilla_reply_as}` as `MAIL FROM`.
@@ -133,7 +134,7 @@ Copy `goguerrilla.conf.sample` to `goguerrilla.conf` and configure:
 | Command | Purpose |
 |---------|---------|
 | `guerrillad serve` | Start SMTP daemon |
-| `guerrillad alias-index` | Poll POP3 and maintain alias index |
+| `guerrillad alias-index` | Poll POP3 / watch IMAP and maintain alias index |
 | `guerrillad version` | Print version |
 
 See `goguerrilla.conf.sample` for a full configuration example.

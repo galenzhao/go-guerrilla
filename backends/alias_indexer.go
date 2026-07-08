@@ -101,10 +101,12 @@ func (a AliasPOP3Account) validate() error {
 	return nil
 }
 
-// AliasIndexerConfig configures the POP3 alias indexer.
+// AliasIndexerConfig configures the alias indexer.
 type AliasIndexerConfig struct {
 	DBPath              string
 	Accounts            []AliasPOP3Account
+	IMAPAccounts        []AliasIMAPAccount
+	IMAP                IMAPWatcherConfig
 	PollInterval        time.Duration
 	PurgeInterval       time.Duration
 	SkipExistingOnStart bool
@@ -113,20 +115,23 @@ type AliasIndexerConfig struct {
 	Registry            TenantRegistry
 }
 
-// AliasIndexer polls one or more POP3 mailboxes and writes alias thread mappings.
+// AliasIndexer polls POP3 mailboxes and watches IMAP folders for alias mappings.
 type AliasIndexer struct {
-	cfg    AliasIndexerConfig
-	store  *AliasStore
-	pollMu sync.Mutex
+	cfg      AliasIndexerConfig
+	store    *AliasStore
+	pollMu   sync.Mutex
+	imapWG   sync.WaitGroup
+	imapStop context.CancelFunc
 }
 
 // NewAliasIndexer creates an indexer using the given config.
 func NewAliasIndexer(cfg AliasIndexerConfig) (*AliasIndexer, error) {
 	if cfg.Registry != nil {
-		// Registry mode: ignore static Accounts; POP3 list comes only from GET /tenants.
+		// Registry mode: ignore static Accounts; mail accounts come only from GET /tenants.
 		cfg.Accounts = nil
-	} else if len(cfg.Accounts) == 0 {
-		return nil, fmt.Errorf("at least one alias_index POP3 account or tenant_registry is required")
+		cfg.IMAPAccounts = nil
+	} else if len(cfg.Accounts) == 0 && len(cfg.IMAPAccounts) == 0 {
+		return nil, fmt.Errorf("at least one alias_index mail account or tenant_registry is required")
 	}
 	for i := range cfg.Accounts {
 		if cfg.Accounts[i].Port <= 0 {
@@ -136,6 +141,15 @@ func NewAliasIndexer(cfg AliasIndexerConfig) (*AliasIndexer, error) {
 			return nil, fmt.Errorf("alias_index_pop3_accounts[%d]: %w", i, err)
 		}
 	}
+	for i := range cfg.IMAPAccounts {
+		if cfg.IMAPAccounts[i].Port <= 0 {
+			cfg.IMAPAccounts[i].Port = 993
+		}
+		if err := cfg.IMAPAccounts[i].validate(); err != nil {
+			return nil, fmt.Errorf("alias_index_imap_accounts[%d]: %w", i, err)
+		}
+	}
+	cfg.IMAP.normalize()
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = 60 * time.Second
 	}
@@ -161,7 +175,15 @@ func NewAliasIndexer(cfg AliasIndexerConfig) (*AliasIndexer, error) {
 
 // Close closes the underlying store.
 func (i *AliasIndexer) Close() error {
-	if i == nil || i.store == nil {
+	if i == nil {
+		return nil
+	}
+	if i.imapStop != nil {
+		i.imapStop()
+		i.imapWG.Wait()
+		i.imapStop = nil
+	}
+	if i.store == nil {
 		return nil
 	}
 	return i.store.Close()
@@ -169,6 +191,10 @@ func (i *AliasIndexer) Close() error {
 
 // Run polls until the done channel is closed.
 func (i *AliasIndexer) Run(done <-chan struct{}) error {
+	imapCtx, imapCancel := context.WithCancel(context.Background())
+	i.imapStop = imapCancel
+	i.startIMAPWatchers(imapCtx)
+
 	purgeTicker := time.NewTicker(i.cfg.PurgeInterval)
 	defer purgeTicker.Stop()
 	pollTicker := time.NewTicker(i.cfg.PollInterval)
@@ -193,6 +219,8 @@ func (i *AliasIndexer) Run(done <-chan struct{}) error {
 	for {
 		select {
 		case <-done:
+			imapCancel()
+			i.imapWG.Wait()
 			return nil
 		case <-purgeTicker.C:
 			if err := i.store.PurgeExpired(); err != nil {
@@ -210,17 +238,35 @@ func (i *AliasIndexer) Run(done <-chan struct{}) error {
 	}
 }
 
+func (i *AliasIndexer) startIMAPWatchers(ctx context.Context) {
+	accounts := i.currentIMAPAccounts()
+	for _, account := range accounts {
+		account := account
+		watcher := newIMAPAccountWatcher(account, i.cfg.IMAP, i)
+		watcher.Run(ctx, &i.imapWG)
+	}
+}
+
 func (i *AliasIndexer) refreshAccountsFromRegistry() {
 	if i.cfg.Registry == nil {
 		return
 	}
-	tagged := i.cfg.Registry.POP3Accounts()
-	accounts := make([]AliasPOP3Account, 0, len(tagged))
-	for _, item := range tagged {
+	taggedPOP3 := i.cfg.Registry.POP3Accounts()
+	accounts := make([]AliasPOP3Account, 0, len(taggedPOP3))
+	for _, item := range taggedPOP3 {
 		accounts = append(accounts, item.Account)
 	}
 	i.cfg.Accounts = accounts
-	Log().WithField("mailboxes", len(accounts)).Info("alias-index refreshed POP3 accounts from tenant registry")
+	taggedIMAP := i.cfg.Registry.IMAPAccounts()
+	imapAccounts := make([]AliasIMAPAccount, 0, len(taggedIMAP))
+	for _, item := range taggedIMAP {
+		imapAccounts = append(imapAccounts, item.Account)
+	}
+	i.cfg.IMAPAccounts = imapAccounts
+	Log().WithFields(map[string]interface{}{
+		"pop3_mailboxes": len(accounts),
+		"imap_accounts":  len(imapAccounts),
+	}).Info("alias-index refreshed mail accounts from tenant registry")
 }
 
 func (i *AliasIndexer) currentAccounts() []AliasPOP3Account {
@@ -234,6 +280,18 @@ func (i *AliasIndexer) currentAccounts() []AliasPOP3Account {
 		return accounts
 	}
 	return i.cfg.Accounts
+}
+
+func (i *AliasIndexer) currentIMAPAccounts() []AliasIMAPAccount {
+	if i.cfg.Registry != nil {
+		tagged := i.cfg.Registry.IMAPAccounts()
+		accounts := make([]AliasIMAPAccount, 0, len(tagged))
+		for _, item := range tagged {
+			accounts = append(accounts, item.Account)
+		}
+		return accounts
+	}
+	return i.cfg.IMAPAccounts
 }
 
 func (i *AliasIndexer) pollAll() {
@@ -329,46 +387,24 @@ func (i *AliasIndexer) pollMailbox(account AliasPOP3Account) error {
 			continue
 		}
 
-		if !i.cfg.Since.IsZero() && !headers.Date.IsZero() && headers.Date.Before(i.cfg.Since) {
-			if err := i.store.MarkUIDLKnown(mailboxKey, item.UIDL); err != nil {
-				return err
-			}
-			skipped++
-			continue
-		}
-
-		messageID := normalizeMessageID(headers.MessageID)
-		replyAs := extractReplyAsAddress(headers, account.User)
-		origFrom := extractFirstEmailFromHeader(headers.From)
-		if messageID == "" || replyAs == "" || origFrom == "" {
-			Log().WithFields(map[string]interface{}{
-				"mailbox":    mailboxKey,
-				"uidl":       item.UIDL,
-				"message_id": headers.MessageID,
-				"to":         headers.To,
-				"delivered":  headers.DeliveredTo,
-				"x_orig":     headers.XOriginalTo,
-				"from":       headers.From,
-			}).Debug("alias-index skipping message without indexable headers")
-			if err := i.store.MarkUIDLKnown(mailboxKey, item.UIDL); err != nil {
-				return err
-			}
-			continue
-		}
-
-		if err := i.store.UpsertThread(AliasThread{
-			MessageID: messageID,
-			ReplyAs:   replyAs,
-			OrigFrom:  origFrom,
-			TenantID:  account.TenantID,
-			CreatedAt: time.Now().UTC(),
-		}); err != nil {
+		outcome, err := indexMessageFromHeaders(i.store, headers, indexMessageOpts{
+			mailboxKey:  mailboxKey,
+			mailboxUser: account.User,
+			tenantID:    account.TenantID,
+			since:       i.cfg.Since,
+		})
+		if err != nil {
 			return err
 		}
 		if err := i.store.MarkUIDLKnown(mailboxKey, item.UIDL); err != nil {
 			return err
 		}
-		indexed++
+		switch outcome {
+		case outcomeIndexed:
+			indexed++
+		case outcomeSkippedDate:
+			skipped++
+		}
 	}
 
 	if indexed > 0 || skipped > 0 {
@@ -433,6 +469,49 @@ func AliasIndexerConfigFromBackend(backendConfig BackendConfig) (AliasIndexerCon
 	} else {
 		cfg.Accounts = accounts
 	}
+	imapAccounts, err := parseAliasIMAPAccounts(backendConfig)
+	if err != nil {
+		if !strings.Contains(err.Error(), "is required") {
+			return cfg, err
+		}
+	} else {
+		cfg.IMAPAccounts = imapAccounts
+	}
+	if raw, ok := backendConfig["alias_index_imap_idle_refresh"].(string); ok && strings.TrimSpace(raw) != "" {
+		d, err := time.ParseDuration(strings.TrimSpace(raw))
+		if err != nil {
+			return cfg, fmt.Errorf("invalid alias_index_imap_idle_refresh: %w", err)
+		}
+		cfg.IMAP.IdleRefresh = d
+	}
+	if raw, ok := backendConfig["alias_index_imap_resync_interval"].(string); ok && strings.TrimSpace(raw) != "" {
+		d, err := time.ParseDuration(strings.TrimSpace(raw))
+		if err != nil {
+			return cfg, fmt.Errorf("invalid alias_index_imap_resync_interval: %w", err)
+		}
+		cfg.IMAP.ResyncInterval = d
+	}
+	if v, ok := backendConfig["alias_index_imap_search_batch"].(float64); ok && int(v) > 0 {
+		cfg.IMAP.SearchBatch = int(v)
+	}
+	if raw, ok := backendConfig["alias_index_imap_exclude_folders"]; ok && raw != nil {
+		items, ok := raw.([]interface{})
+		if !ok {
+			return cfg, fmt.Errorf("alias_index_imap_exclude_folders must be an array")
+		}
+		cfg.IMAP.ExcludeFolders = make(map[string]struct{}, len(items))
+		for i, item := range items {
+			name, ok := item.(string)
+			if !ok {
+				return cfg, fmt.Errorf("alias_index_imap_exclude_folders[%d] must be a string", i)
+			}
+			name = strings.TrimSpace(name)
+			if name != "" {
+				cfg.IMAP.ExcludeFolders[name] = struct{}{}
+			}
+		}
+	}
+	cfg.IMAP.normalize()
 	cfg.StoreCfg.DBPath = cfg.DBPath
 	return cfg, nil
 }
@@ -505,6 +584,54 @@ func parseAliasPOP3AccountMap(m map[string]interface{}) (AliasPOP3Account, error
 	account := AliasPOP3Account{
 		TLS:  true,
 		Port: 995,
+	}
+	if v, ok := m["host"].(string); ok {
+		account.Host = strings.TrimSpace(v)
+	}
+	if v, ok := m["user"].(string); ok {
+		account.User = strings.TrimSpace(v)
+	}
+	if v, ok := m["password"].(string); ok {
+		account.Password = v
+	}
+	if v, ok := m["port"].(float64); ok && int(v) > 0 {
+		account.Port = int(v)
+	}
+	if v, ok := m["tls"].(bool); ok {
+		account.TLS = v
+	}
+	return account, account.validate()
+}
+
+func parseAliasIMAPAccounts(backendConfig BackendConfig) ([]AliasIMAPAccount, error) {
+	if raw, ok := backendConfig["alias_index_imap_accounts"]; ok && raw != nil {
+		items, ok := raw.([]interface{})
+		if !ok {
+			return nil, fmt.Errorf("alias_index_imap_accounts must be an array")
+		}
+		accounts := make([]AliasIMAPAccount, 0, len(items))
+		for i, item := range items {
+			m, ok := item.(map[string]interface{})
+			if !ok {
+				return nil, fmt.Errorf("alias_index_imap_accounts[%d] must be an object", i)
+			}
+			account, err := parseAliasIMAPAccountMap(m)
+			if err != nil {
+				return nil, fmt.Errorf("alias_index_imap_accounts[%d]: %w", i, err)
+			}
+			accounts = append(accounts, account)
+		}
+		if len(accounts) > 0 {
+			return accounts, nil
+		}
+	}
+	return nil, fmt.Errorf("alias_index_imap_accounts is required")
+}
+
+func parseAliasIMAPAccountMap(m map[string]interface{}) (AliasIMAPAccount, error) {
+	account := AliasIMAPAccount{
+		TLS:  true,
+		Port: 993,
 	}
 	if v, ok := m["host"].(string); ok {
 		account.Host = strings.TrimSpace(v)

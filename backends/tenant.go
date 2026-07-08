@@ -43,6 +43,15 @@ type TenantPOP3 struct {
 	Password string `json:"password"`
 }
 
+// TenantIMAP is an IMAP mailbox used for real-time alias indexing.
+type TenantIMAP struct {
+	Host     string `json:"host"`
+	Port     int    `json:"port,omitempty"`
+	TLS      bool   `json:"tls,omitempty"`
+	User     string `json:"user"`
+	Password string `json:"password"`
+}
+
 // Tenant is a full tenant record from the registry.
 type Tenant struct {
 	TenantID     string         `json:"tenant_id"`
@@ -50,12 +59,19 @@ type Tenant struct {
 	SES          *TenantSES     `json:"ses,omitempty"`
 	OCIEmail     *TenantOCI     `json:"ociemail,omitempty"`
 	POP3Accounts []TenantPOP3   `json:"pop3_accounts,omitempty"`
+	IMAPAccounts []TenantIMAP   `json:"imap_accounts,omitempty"`
 }
 
 // TaggedPOP3Account is a POP3 account with its owning tenant.
 type TaggedPOP3Account struct {
 	TenantID string
 	Account  AliasPOP3Account
+}
+
+// TaggedIMAPAccount is an IMAP account with its owning tenant.
+type TaggedIMAPAccount struct {
+	TenantID string
+	Account  AliasIMAPAccount
 }
 
 // tenantsListResponse is the JSON body from GET /tenants.
@@ -70,6 +86,7 @@ type tenantJSON struct {
 	SES          *TenantSES      `json:"ses,omitempty"`
 	OCIEmail     *TenantOCI      `json:"ociemail,omitempty"`
 	POP3Accounts []TenantPOP3    `json:"pop3_accounts,omitempty"`
+	IMAPAccounts []TenantIMAP    `json:"imap_accounts,omitempty"`
 	OK           bool            `json:"ok,omitempty"`
 }
 
@@ -124,6 +141,7 @@ func parseTenantRecord(raw tenantJSON) (*Tenant, error) {
 		SES:          send.SES,
 		OCIEmail:     send.OCIEmail,
 		POP3Accounts: raw.POP3Accounts,
+		IMAPAccounts: raw.IMAPAccounts,
 	}
 	for i := range t.POP3Accounts {
 		if t.POP3Accounts[i].Port <= 0 {
@@ -132,6 +150,14 @@ func parseTenantRecord(raw tenantJSON) (*Tenant, error) {
 		if !t.POP3Accounts[i].TLS {
 			// default TLS true for POP3
 			t.POP3Accounts[i].TLS = true
+		}
+	}
+	for i := range t.IMAPAccounts {
+		if t.IMAPAccounts[i].Port <= 0 {
+			t.IMAPAccounts[i].Port = 993
+		}
+		if !t.IMAPAccounts[i].TLS {
+			t.IMAPAccounts[i].TLS = true
 		}
 	}
 	return t, nil

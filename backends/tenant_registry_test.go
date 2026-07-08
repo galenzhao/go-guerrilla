@@ -31,6 +31,24 @@ func TestParseTenantsList(t *testing.T) {
 	}
 }
 
+func TestParseTenantsListIMAPAccounts(t *testing.T) {
+	body := []byte(`{
+		"tenants": [{
+			"tenant_id": "acme",
+			"provider": "oci",
+			"ociemail": {"region":"us-phoenix-1","username":"u","password":"p"},
+			"imap_accounts": [{"host":"imap.example.com","user":"a@acme.com","password":"pw"}]
+		}]
+	}`)
+	tenants, err := ParseTenantsList(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tenants[0].IMAPAccounts) != 1 || tenants[0].IMAPAccounts[0].Port != 993 {
+		t.Fatalf("unexpected imap accounts: %+v", tenants[0].IMAPAccounts)
+	}
+}
+
 func TestHTTPTenantRegistryRefresh(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -65,6 +83,10 @@ func TestHTTPTenantRegistryRefresh(t *testing.T) {
 	pop3 := reg.POP3Accounts()
 	if len(pop3) != 1 || pop3[0].TenantID != "beta" {
 		t.Fatalf("unexpected pop3 accounts: %+v", pop3)
+	}
+	imap := reg.IMAPAccounts()
+	if imap != nil && len(imap) != 0 {
+		t.Fatalf("expected no imap accounts: %+v", imap)
 	}
 }
 

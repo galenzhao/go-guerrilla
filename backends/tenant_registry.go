@@ -24,6 +24,7 @@ type TenantRegistry interface {
 	All() []Tenant
 	Get(tenantID string) (*Tenant, bool)
 	POP3Accounts() []TaggedPOP3Account
+	IMAPAccounts() []TaggedIMAPAccount
 	PollInterval() time.Duration
 }
 
@@ -33,6 +34,7 @@ type httpTenantRegistry struct {
 	mu       sync.RWMutex
 	tenants  map[string]Tenant
 	pop3List []TaggedPOP3Account
+	imapList []TaggedIMAPAccount
 }
 
 var (
@@ -142,6 +144,7 @@ func (r *httpTenantRegistry) Refresh(ctx context.Context) error {
 func (r *httpTenantRegistry) applyTenants(tenants []Tenant) {
 	byID := make(map[string]Tenant, len(tenants))
 	pop3 := make([]TaggedPOP3Account, 0)
+	imap := make([]TaggedIMAPAccount, 0)
 	for _, t := range tenants {
 		byID[t.TenantID] = t
 		for _, p := range t.POP3Accounts {
@@ -158,10 +161,25 @@ func (r *httpTenantRegistry) applyTenants(tenants []Tenant) {
 			}
 			pop3 = append(pop3, TaggedPOP3Account{TenantID: t.TenantID, Account: acc})
 		}
+		for _, p := range t.IMAPAccounts {
+			acc := AliasIMAPAccount{
+				Host:     strings.TrimSpace(p.Host),
+				Port:     p.Port,
+				TLS:      p.TLS,
+				User:     strings.TrimSpace(p.User),
+				Password: p.Password,
+				TenantID: t.TenantID,
+			}
+			if acc.Port <= 0 {
+				acc.Port = 993
+			}
+			imap = append(imap, TaggedIMAPAccount{TenantID: t.TenantID, Account: acc})
+		}
 	}
 	r.mu.Lock()
 	r.tenants = byID
 	r.pop3List = pop3
+	r.imapList = imap
 	r.mu.Unlock()
 }
 
@@ -191,6 +209,14 @@ func (r *httpTenantRegistry) POP3Accounts() []TaggedPOP3Account {
 	defer r.mu.RUnlock()
 	out := make([]TaggedPOP3Account, len(r.pop3List))
 	copy(out, r.pop3List)
+	return out
+}
+
+func (r *httpTenantRegistry) IMAPAccounts() []TaggedIMAPAccount {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]TaggedIMAPAccount, len(r.imapList))
+	copy(out, r.imapList)
 	return out
 }
 

@@ -18,6 +18,7 @@ func (s *stubPOP3Registry) POP3Accounts() []TaggedPOP3Account {
 	copy(out, s.accounts)
 	return out
 }
+func (s *stubPOP3Registry) IMAPAccounts() []TaggedIMAPAccount { return nil }
 func (s *stubPOP3Registry) PollInterval() time.Duration { return time.Minute }
 
 func TestAliasIndexerIgnoresStaticAccountsWhenRegistrySet(t *testing.T) {

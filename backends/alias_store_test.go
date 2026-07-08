@@ -178,3 +178,35 @@ func TestAliasStoreKnownUIDLsForMailbox(t *testing.T) {
 		t.Fatalf("unexpected known set: %+v", known)
 	}
 }
+
+func TestAliasStoreIMAPCursorAndSeenMessage(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenAliasStore(AliasStoreConfig{DBPath: filepath.Join(dir, "alias.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	mailbox := "imap:user@example.com@imap.example.com"
+	folder := "INBOX"
+	if err := store.SetIMAPCursor(IMAPCursor{
+		Mailbox:      mailbox,
+		Folder:       folder,
+		UIDValidity:  42,
+		LastUID:      100,
+		BaselineDone: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cursor, err := store.GetIMAPCursor(mailbox, folder)
+	if err != nil || cursor == nil || cursor.LastUID != 100 || !cursor.BaselineDone {
+		t.Fatalf("unexpected cursor: %+v err=%v", cursor, err)
+	}
+	if err := store.MarkSeenMessage(mailbox, "<seen@example.com>"); err != nil {
+		t.Fatal(err)
+	}
+	seen, err := store.IsSeenMessage(mailbox, "seen@example.com")
+	if err != nil || !seen {
+		t.Fatalf("expected seen message")
+	}
+}
