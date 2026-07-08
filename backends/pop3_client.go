@@ -153,3 +153,18 @@ func (c *pop3Client) Retr(num int) (string, error) {
 	}
 	return strings.Join(lines, "\n"), nil
 }
+
+// Top retrieves the first lines of a message (headers only for alias indexing).
+func (c *pop3Client) Top(num, lines int) (string, error) {
+	if lines <= 0 {
+		lines = 128
+	}
+	if _, err := c.cmd("TOP %d %d", num, lines); err != nil {
+		return "", err
+	}
+	raw, err := c.readMultiline()
+	if err != nil {
+		return "", err
+	}
+	return strings.Join(raw, "\n"), nil
+}

@@ -1,6 +1,7 @@
 package backends
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -130,4 +131,50 @@ func TestAliasStoreUIDLBaseline(t *testing.T) {
 		t.Fatalf("baseline not set")
 	}
 	_ = os.RemoveAll(dir)
+}
+
+func TestAliasStoreMarkUIDLsKnownBatched(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenAliasStore(AliasStoreConfig{DBPath: filepath.Join(dir, "alias.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	key := "pop3:all@example.com"
+	uidls := make([]string, aliasIndexUIDLBatchSize+50)
+	for i := range uidls {
+		uidls[i] = fmt.Sprintf("uid-%d", i)
+	}
+	if err := store.MarkUIDLsKnown(key, uidls); err != nil {
+		t.Fatal(err)
+	}
+	known, err := store.KnownUIDLsForMailbox(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(known) != len(uidls) {
+		t.Fatalf("expected %d known uidls, got %d", len(uidls), len(known))
+	}
+}
+
+func TestAliasStoreKnownUIDLsForMailbox(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenAliasStore(AliasStoreConfig{DBPath: filepath.Join(dir, "alias.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	key := "pop3:user@example.com"
+	if err := store.MarkUIDLsKnown(key, []string{"a", "b"}); err != nil {
+		t.Fatal(err)
+	}
+	known, err := store.KnownUIDLsForMailbox(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := known["a"]; !ok || len(known) != 2 {
+		t.Fatalf("unexpected known set: %+v", known)
+	}
 }

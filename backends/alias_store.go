@@ -14,6 +14,7 @@ const (
 	defaultAliasIndexTTL       = 180 * 24 * time.Hour
 	defaultAliasIndexMaxRows   = 100000
 	defaultAliasIndexPurge     = time.Hour
+	aliasIndexUIDLBatchSize    = 2000
 	aliasThreadsSchema         = `
 CREATE TABLE IF NOT EXISTS alias_threads (
   message_id TEXT PRIMARY KEY,
@@ -338,12 +339,28 @@ func (s *AliasStore) MarkUIDLKnown(mailbox, uidl string) error {
 	return err
 }
 
-// MarkUIDLsKnown records many UIDLs in one transaction for a mailbox.
+// MarkUIDLsKnown records many UIDLs in batched transactions for a mailbox.
 func (s *AliasStore) MarkUIDLsKnown(mailbox string, uidls []string) error {
 	if len(uidls) == 0 {
 		return nil
 	}
 	mailbox = strings.TrimSpace(mailbox)
+	for start := 0; start < len(uidls); start += aliasIndexUIDLBatchSize {
+		end := start + aliasIndexUIDLBatchSize
+		if end > len(uidls) {
+			end = len(uidls)
+		}
+		if err := s.markUIDLsKnownBatch(mailbox, uidls[start:end]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *AliasStore) markUIDLsKnownBatch(mailbox string, uidls []string) error {
+	if len(uidls) == 0 {
+		return nil
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -366,6 +383,28 @@ func (s *AliasStore) MarkUIDLsKnown(mailbox string, uidls []string) error {
 		}
 	}
 	return tx.Commit()
+}
+
+// KnownUIDLsForMailbox returns all recorded UIDLs for a mailbox.
+func (s *AliasStore) KnownUIDLsForMailbox(mailbox string) (map[string]struct{}, error) {
+	if s == nil || s.db == nil {
+		return nil, fmt.Errorf("alias store not open")
+	}
+	mailbox = strings.TrimSpace(mailbox)
+	rows, err := s.db.Query(`SELECT uidl FROM alias_index_uidl WHERE mailbox = ?`, mailbox)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	known := make(map[string]struct{})
+	for rows.Next() {
+		var uidl string
+		if err := rows.Scan(&uidl); err != nil {
+			return nil, err
+		}
+		known[uidl] = struct{}{}
+	}
+	return known, rows.Err()
 }
 
 // ParseAliasDuration parses config durations like "180d" or "1h".

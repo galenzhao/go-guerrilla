@@ -115,8 +115,9 @@ type AliasIndexerConfig struct {
 
 // AliasIndexer polls one or more POP3 mailboxes and writes alias thread mappings.
 type AliasIndexer struct {
-	cfg   AliasIndexerConfig
-	store *AliasStore
+	cfg    AliasIndexerConfig
+	store  *AliasStore
+	pollMu sync.Mutex
 }
 
 // NewAliasIndexer creates an indexer using the given config.
@@ -236,6 +237,12 @@ func (i *AliasIndexer) currentAccounts() []AliasPOP3Account {
 }
 
 func (i *AliasIndexer) pollAll() {
+	if !i.pollMu.TryLock() {
+		Log().Debug("alias-index poll skipped; previous poll still running")
+		return
+	}
+	defer i.pollMu.Unlock()
+
 	accounts := i.currentAccounts()
 	if len(accounts) == 0 {
 		return
@@ -288,24 +295,25 @@ func (i *AliasIndexer) pollMailbox(account AliasPOP3Account) error {
 			return err
 		}
 		Log().WithFields(map[string]interface{}{
-			"mailbox":   mailboxKey,
+			"mailbox":    mailboxKey,
 			"uidl_count": len(known),
 		}).Info("alias-index recorded POP3 UIDL baseline; existing mail skipped")
 		return nil
 	}
 
+	knownUIDLs, err := i.store.KnownUIDLsForMailbox(mailboxKey)
+	if err != nil {
+		return err
+	}
+
 	indexed := 0
 	skipped := 0
 	for _, item := range uidls {
-		known, err := i.store.IsKnownUIDL(mailboxKey, item.UIDL)
-		if err != nil {
-			return err
-		}
-		if known {
+		if _, known := knownUIDLs[item.UIDL]; known {
 			continue
 		}
 
-		raw, err := client.Retr(item.Number)
+		raw, err := client.Top(item.Number, 128)
 		if err != nil {
 			return err
 		}
