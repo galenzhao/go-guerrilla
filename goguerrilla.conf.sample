@@ -39,7 +39,8 @@
         "alias_index_imap_idle_refresh": "28m",
         "alias_index_imap_resync_interval": "5m",
         "alias_index_imap_search_batch": 500,
-        "alias_index_imap_exclude_folders": [],
+        "alias_index_imap_baseline_header_limit": 200,
+        "alias_index_imap_exclude_folders": ["Deleted Messages"],
 
         "ociemail_timeout": "10s",
         "ociemail_fail_hard": true,

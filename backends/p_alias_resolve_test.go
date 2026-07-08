@@ -61,6 +61,72 @@ func TestAliasResolveInjectTenantSend(t *testing.T) {
 	}
 }
 
+func TestAliasResolveRejectsCrossTenantHijack(t *testing.T) {
+	defer Svc.reset()
+	defer SetGlobalTenantRegistry(nil)
+
+	dir := t.TempDir()
+	dbPath := dir + "/alias.db"
+	store, err := OpenAliasStore(AliasStoreConfig{DBPath: dbPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Thread belongs to tenant "acme", indexed from acme's own mailbox.
+	if err := store.UpsertThread(AliasThread{
+		MessageID: "<acme-thread@qq.com>",
+		ReplyAs:   "support@acme.example.com",
+		OrigFrom:  "customer@acme.example.com",
+		TenantID:  "acme",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+
+	reg := &stubTenantRegistry{tenants: map[string]Tenant{
+		"acme": {
+			TenantID: "acme",
+			Provider: "oci",
+			OCIEmail: &TenantOCI{Region: "us-phoenix-1", Username: "acme-user", Password: "acme-pass"},
+		},
+		"evil": {
+			TenantID: "evil",
+			Provider: "oci",
+			OCIEmail: &TenantOCI{Region: "us-phoenix-1", Username: "evil-user", Password: "evil-pass"},
+		},
+	}}
+	SetGlobalTenantRegistry(reg)
+
+	deco := AliasResolve()
+	p := deco(ProcessWith(func(e *mail.Envelope, task SelectTask) (Result, error) {
+		return NewResult("250 OK"), nil
+	}))
+
+	if err := Svc.initialize(BackendConfig{"alias_db_path": dbPath, "alias_fail_hard": false}); len(err) > 0 {
+		t.Fatalf("init errors: %v", err)
+	}
+
+	// Simulate a client authenticated as tenant "evil" (as server.go does right
+	// after SMTP AUTH, before the backend pipeline runs), then forging an
+	// In-Reply-To that matches a thread belonging to tenant "acme".
+	e := mail.NewEnvelope("127.0.0.1", 1)
+	SetEnvelopeTenantSend(e, &TenantSendConfig{TenantID: "evil", Provider: "oci"})
+	e.Data.WriteString("In-Reply-To: <acme-thread@qq.com>\r\n\r\nBody\r\n")
+	_ = e.ParseHeaders()
+
+	// Even though alias_fail_hard is false, the tenant-isolation check must
+	// still reject the message rather than silently continue.
+	res, err := p.Process(e, TaskSaveMail)
+	if err == nil {
+		t.Fatal("expected error rejecting cross-tenant reply-as hijack")
+	}
+	if res.Code() != 554 {
+		t.Fatalf("expected 554, got %d (%s)", res.Code(), res.String())
+	}
+	if cfg := GetEnvelopeTenantSend(e); cfg == nil || cfg.TenantID != "evil" {
+		t.Fatalf("expected envelope tenant to remain the authenticated one (evil), got %+v", cfg)
+	}
+}
+
 func TestAliasResolveRequiresTenantWhenRegistryConfigured(t *testing.T) {
 	defer Svc.reset()
 	defer SetGlobalTenantRegistry(nil)

@@ -108,6 +108,13 @@ func (c *pop3Client) readMultiline() ([]string, error) {
 }
 
 func (c *pop3Client) Auth(user, password string) error {
+	// user/password now originate from the tenant_registry HTTP response, not
+	// just local static config, and cmd() writes them straight onto the wire
+	// with no escaping. Reject embedded CR/LF rather than letting it smuggle
+	// extra POP3 commands into the session.
+	if strings.ContainsAny(user, "\r\n") || strings.ContainsAny(password, "\r\n") {
+		return fmt.Errorf("pop3 auth: user/password must not contain CR or LF")
+	}
 	if _, err := c.cmd("USER %s", user); err != nil {
 		return err
 	}

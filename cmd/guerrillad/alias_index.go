@@ -39,6 +39,7 @@ func runAliasIndex(cmd *cobra.Command, args []string) {
 	if verbose {
 		mainlog, _ = log.GetLogger(log.OutputStderr.String(), log.DebugLevel.String())
 	}
+	backends.Svc.SetMainlog(mainlog)
 
 	appConfig, backendConfig, err := loadAppAndBackendConfig(aliasIndexConfigPath)
 	if err != nil {
@@ -75,11 +76,15 @@ func runAliasIndex(cmd *cobra.Command, args []string) {
 	defer indexer.Close()
 
 	done := make(chan struct{})
-	signalCh := make(chan os.Signal, 1)
+	signalCh := make(chan os.Signal, 2)
 	signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	go func() {
 		<-signalCh
+		mainlog.Info("alias-index shutting down (press Ctrl+C again to force quit)")
 		close(done)
+		<-signalCh
+		mainlog.Warn("alias-index force exit")
+		os.Exit(1)
 	}()
 
 	mainlog.Info("alias-index started")

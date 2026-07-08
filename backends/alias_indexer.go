@@ -220,7 +220,16 @@ func (i *AliasIndexer) Run(done <-chan struct{}) error {
 		select {
 		case <-done:
 			imapCancel()
-			i.imapWG.Wait()
+			shutdownDone := make(chan struct{})
+			go func() {
+				i.imapWG.Wait()
+				close(shutdownDone)
+			}()
+			select {
+			case <-shutdownDone:
+			case <-time.After(10 * time.Second):
+				Log().Warn("alias-index imap watchers did not exit within 10s")
+			}
 			return nil
 		case <-purgeTicker.C:
 			if err := i.store.PurgeExpired(); err != nil {
@@ -493,6 +502,9 @@ func AliasIndexerConfigFromBackend(backendConfig BackendConfig) (AliasIndexerCon
 	}
 	if v, ok := backendConfig["alias_index_imap_search_batch"].(float64); ok && int(v) > 0 {
 		cfg.IMAP.SearchBatch = int(v)
+	}
+	if v, ok := backendConfig["alias_index_imap_baseline_header_limit"].(float64); ok && int(v) > 0 {
+		cfg.IMAP.BaselineHeaderLimit = int(v)
 	}
 	if raw, ok := backendConfig["alias_index_imap_exclude_folders"]; ok && raw != nil {
 		items, ok := raw.([]interface{})

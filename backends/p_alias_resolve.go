@@ -144,6 +144,22 @@ func AliasResolve() Decorator {
 					err := fmt.Errorf("alias thread missing tenant_id while tenant_registry is configured")
 					return aliasResolveFail(cfg.FailHard, e, messageIDs, matchedID, err, p, task)
 				}
+				// The envelope may already carry send credentials set from SMTP AUTH
+				// (see server.go). A client can put any Message-ID it has seen
+				// (its own inbox, a forwarded copy, a bounce) into In-Reply-To, so an
+				// alias-indexed thread belonging to a different tenant than the one
+				// that authenticated must never be allowed to override those
+				// credentials — that would let one tenant relay mail through
+				// another tenant's OCI/SES account. This check always fails hard,
+				// regardless of alias_fail_hard, because it guards a tenant
+				// isolation boundary rather than a data-availability condition.
+				if authTenant := GetEnvelopeTenantSend(e); authTenant != nil && authTenant.TenantID != "" && authTenant.TenantID != thread.TenantID {
+					err := fmt.Errorf(
+						"reply-as thread belongs to tenant %q but authenticated tenant is %q; refusing to switch send credentials",
+						thread.TenantID, authTenant.TenantID,
+					)
+					return aliasResolveFail(true, e, messageIDs, matchedID, err, p, task)
+				}
 				tenant, ok := reg.Get(thread.TenantID)
 				if !ok {
 					err := fmt.Errorf("tenant %q not found in tenant_registry", thread.TenantID)
